@@ -159,8 +159,8 @@ class PFFBertEmbeddings(keras.layers.Layer):
                 name="weight",
                 shape=(
                     [self.config.vocab_size, self.hidden_size]
-                    if not self.factorized_size 
-                    else [self.config.vocab_size, self.factorized_size]
+                    # if not self.factorized_size 
+                    # else [self.config.vocab_size, self.factorized_size]
                 ),
                 initializer=get_initializer(self.initializer_range),
             )
@@ -191,6 +191,14 @@ class PFFBertEmbeddings(keras.layers.Layer):
                 self.FactorNorm.build([None, None, self.factorized_size])
             with tf.name_scope(self.EmbedProject.name):
                 self.EmbedProject.build([None, None, self.factorized_size])
+
+    def shrink(self):
+        import cudf, cuml
+        condense_df = cudf.DataFrame(self.weight.numpy())
+        dim_r = cuml.UMAP(n_neighbors=100, n_components=self.factorized_size)
+        factorized_embeddings = dim_r.fit_transform(condense_df)
+        prepared_embeddings = tf.Variable(factorized_embeddings.to_numpy())
+        return prepared_embeddings
 
     def call(
         self,
@@ -667,6 +675,9 @@ class PFFBertMainLayer(keras.layers.Layer):
         if getattr(self, "embeddings", None) is not None:
             with tf.name_scope(self.embeddings.name):
                 self.embeddings.build(None)
+                if self.config.get('factorized_size'):
+                    factorized_weights = self.embeddings.shrink()
+                    self.set_input_embeddings(factorized_weights)
         if getattr(self, "encoder", None) is not None:
             with tf.name_scope(self.encoder.name):
                 self.encoder.build(None)
