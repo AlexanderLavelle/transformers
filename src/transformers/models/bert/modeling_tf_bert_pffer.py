@@ -145,8 +145,8 @@ class PFFBertEmbeddings(keras.layers.Layer):
         self.hidden_size = config.hidden_size
         self.max_position_embeddings = config.max_position_embeddings
         self.initializer_range = config.initializer_range
-        self.LayerNorm = keras.layers.LayerNormalization(epsilon=self.config.layer_norm_eps, name="LayerNorm")
-        self.dropout = keras.layers.Dropout(rate=self.config.hidden_dropout_prob)
+        self.LayerNorm = keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
+        self.dropout = keras.layers.Dropout(rate=config.hidden_dropout_prob)
 
         if kwargs.get('factorized_size'):
             self.factorized_size = kwargs.get('factorized_size')
