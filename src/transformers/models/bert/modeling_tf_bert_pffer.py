@@ -148,10 +148,10 @@ class PFFBertEmbeddings(keras.layers.Layer):
         self.LayerNorm = keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
         self.dropout = keras.layers.Dropout(rate=config.hidden_dropout_prob)
 
-        self.factorized_size = kwargs.get('factorized_size')
-        if self.factorized_size:
-            self.FactorNorm = keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="FactorNorm")
-            self.EmbedProject = keras.layers.Dense(self.hidden_size, name='EmbedProject')
+        if kwargs.get('factorized_size'):
+            self.factorized_size = kwargs.get('factorized_size')
+            self.FactorNorm = keras.layers.LayerNormalization(epsilon=self.config.layer_norm_eps, name="FactorNorm")
+            self.EmbedProject = keras.layers.Dense(self.config.hidden_size, name='EmbedProject')
 
     def build(self, input_shape=None):
         with tf.name_scope("word_embeddings"):
@@ -192,13 +192,38 @@ class PFFBertEmbeddings(keras.layers.Layer):
             with tf.name_scope(self.EmbedProject.name):
                 self.EmbedProject.build([None, None, self.factorized_size])
 
-    def shrink(self):
-        import cudf, cuml
-        condense_df = cudf.DataFrame(self.weight.numpy())
+    def shrink(self, weights=None):
+        import cupy, cuml
+
+        to_shrink = self.weight.numpy() # if weights is None else weights
+        
+        condense_array = cupy.array(to_shrink, copy=False)
         dim_r = cuml.UMAP(n_neighbors=100, n_components=self.factorized_size)
-        factorized_embeddings = dim_r.fit_transform(condense_df)
-        prepared_embeddings = tf.Variable(factorized_embeddings.to_numpy())
+        factorized_embeddings = dim_r.fit_transform(condense_array)
+        
+        prepared_embeddings = tf.Variable(factorized_embeddings.get())
+
         return prepared_embeddings
+
+    def set_weights_and_shrink(self, weights=None, dim=128):
+
+        if not hasattr(self, "factorized_size"):
+
+            self.factorized_size = dim
+            print(f'factorized size set to {self.factorized_size}')
+            
+            self.FactorNorm = keras.layers.LayerNormalization(epsilon=self.config.layer_norm_eps, name="FactorNorm")
+            self.EmbedProject = keras.layers.Dense(self.hidden_size, name='EmbedProject')
+    
+            with tf.name_scope(self.FactorNorm.name):
+                self.FactorNorm.build([None, None, self.factorized_size])
+            with tf.name_scope(self.EmbedProject.name):
+                self.EmbedProject.build([None, None, self.factorized_size])
+
+        factorized_weights = self.shrink(weights)
+        self.weight = factorized_weights
+
+        return None
 
     def call(
         self,
@@ -459,6 +484,53 @@ class PFFBertEncoder(keras.layers.Layer):
               # del self.layer_0
 
               del del_layer
+
+    def expand_ff(self, desired_size=2048):
+        # https://arxiv.org/pdf/2308.06103.pdf
+
+        hidden_size = self.config.__dict__['hidden_size']
+        intermediate_size = self.config.__dict__['intermediate_size']
+        
+        p_delta = desired_size - intermediate_size
+        update_hf_config(self.config, 'intermediate_size', desired_size)
+
+        new_weights = [
+            tf.concat([
+                self.intermediate.weights[0],
+                tf.zeros(shape=[hidden_size, p_delta])
+            ], axis=1),
+            tf.concat([
+                self.intermediate.weights[1],
+                tf.zeros(p_delta)
+            ], axis=0)
+        ]
+
+        delattr(self, 'intermediate')
+        self.intermediate = TFBertIntermediate(self.config, name="intermediate")
+        with tf.name_scope(self.intermediate.name):
+              self.intermediate.build(None)
+            
+        self.intermediate.set_weights(new_weights)
+
+        new_weights = [
+            tf.concat([
+                self.bert_output.weights[0],
+                tf.zeros(shape=[p_delta, hidden_size])
+            ], axis=0),
+            *self.bert_output.weights[1:]
+        ]
+
+        delattr(self, 'bert_output')
+        self.bert_output = TFBertOutput(self.config, name="output")
+        with tf.name_scope(self.bert_output.name):
+              self.bert_output.build(None)
+        
+        self.bert_output.set_weights(new_weights)
+
+        # what about layernorm?
+
+        return None
+    
     
     # A bit cleaner but eh...
     # def build(self, input_shape=None):
@@ -500,8 +572,9 @@ class PFFBertMainLayer(keras.layers.Layer):
         return self.embeddings
 
     def set_input_embeddings(self, value: tf.Variable):
-        self.embeddings.weight = value
-        self.embeddings.vocab_size = shape_list(value)[0]
+        if value is not None:
+            self.embeddings.weight = value
+            self.embeddings.vocab_size = shape_list(value)[0]
 
     def _prune_heads(self, heads_to_prune):
         """
@@ -675,7 +748,7 @@ class PFFBertMainLayer(keras.layers.Layer):
         if getattr(self, "embeddings", None) is not None:
             with tf.name_scope(self.embeddings.name):
                 self.embeddings.build(None)
-                if self.config.get('factorized_size'):
+                if self.config.__dict__.get('factorized_size'):
                     factorized_weights = self.embeddings.shrink()
                     self.set_input_embeddings(factorized_weights)
         if getattr(self, "encoder", None) is not None:
