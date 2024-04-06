@@ -508,7 +508,7 @@ class PFFBertEncoder(keras.layers.Layer):
         delattr(self, 'intermediate')
         self.intermediate = TFBertIntermediate(self.config, name="intermediate")
         with tf.name_scope(self.intermediate.name):
-              self.intermediate.build(None)
+            self.intermediate.build(None)
             
         self.intermediate.set_weights(new_weights)
 
@@ -523,7 +523,7 @@ class PFFBertEncoder(keras.layers.Layer):
         delattr(self, 'bert_output')
         self.bert_output = TFBertOutput(self.config, name="output")
         with tf.name_scope(self.bert_output.name):
-              self.bert_output.build(None)
+            self.bert_output.build(None)
         
         self.bert_output.set_weights(new_weights)
 
