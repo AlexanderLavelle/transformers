@@ -1,21 +1,3 @@
-# coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
-# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-""" TF 2.0 BERT model."""
-
-
 from __future__ import annotations
 
 import math
@@ -26,8 +8,8 @@ from typing import Dict, Optional, Tuple, Union
 import numpy as np
 import tensorflow as tf
 
-from ...activations_tf import get_tf_activation
-from ...modeling_tf_outputs import (
+from transformers.activations_tf import get_tf_activation
+from transformers.modeling_tf_outputs import (
     TFBaseModelOutputWithPastAndCrossAttentions,
     TFBaseModelOutputWithPoolingAndCrossAttentions,
     TFCausalLMOutputWithCrossAttentions,
@@ -38,7 +20,7 @@ from ...modeling_tf_outputs import (
     TFSequenceClassifierOutput,
     TFTokenClassifierOutput,
 )
-from ...modeling_tf_utils import (
+from transformers.modeling_tf_utils import (
     TFCausalLanguageModelingLoss,
     TFMaskedLanguageModelingLoss,
     TFModelInputType,
@@ -53,8 +35,8 @@ from ...modeling_tf_utils import (
     keras_serializable,
     unpack_inputs,
 )
-from ...tf_utils import check_embeddings_within_bounds, shape_list, stable_softmax
-from ...utils import (
+from transformers.tf_utils import check_embeddings_within_bounds, shape_list, stable_softmax
+from transformers.utils import (
     ModelOutput,
     add_code_sample_docstrings,
     add_start_docstrings,
@@ -62,8 +44,9 @@ from ...utils import (
     logging,
     replace_return_docstrings,
 )
-from .configuration_bert import BertConfig
-from .modeling_tf_bert import (
+from transformers.models.bert.configuration_bert import BertConfig
+
+from transformers.models.bert.modeling_tf_bert import (
     TFBertPreTrainingLoss,
     TFBertSelfOutput,
     TFBertOutput,
@@ -83,6 +66,10 @@ from .modeling_tf_bert import (
     TFBertForTokenClassification,
     TFBertNSPHead,
     TFBertMLMHead,
+)
+
+from transformers.models.roformer.modeling_tf_roformer import (
+    TFRoFormerSinusoidalPositionalEmbedding as rope_embeddings
 )
 
 
@@ -135,6 +122,7 @@ TF_BERT_PRETRAINED_MODEL_ARCHIVE_LIST = [
 ]
 
 
+
 class PFFBertEmbeddings(keras.layers.Layer):
     """Construct the embeddings from word, position and token_type embeddings."""
 
@@ -145,13 +133,13 @@ class PFFBertEmbeddings(keras.layers.Layer):
         self.hidden_size = config.hidden_size
         self.max_position_embeddings = config.max_position_embeddings
         self.initializer_range = config.initializer_range
-        self.LayerNorm = keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="LayerNorm")
-        self.dropout = keras.layers.Dropout(rate=config.hidden_dropout_prob)
+        self.LayerNorm = keras.layers.LayerNormalization(epsilon=self.config.layer_norm_eps, name="LayerNorm")
+        self.dropout = keras.layers.Dropout(rate=self.config.hidden_dropout_prob)
 
-        self.factorized_size = kwargs.get('factorized_size')
-        if self.factorized_size:
-            self.FactorNorm = keras.layers.LayerNormalization(epsilon=config.layer_norm_eps, name="FactorNorm")
-            self.EmbedProject = keras.layers.Dense(self.hidden_size, name='EmbedProject')
+        if kwargs.get('factorized_size'):
+            self.factorized_size = kwargs.get('factorized_size')
+            self.FactorNorm = keras.layers.LayerNormalization(epsilon=self.config.layer_norm_eps, name="FactorNorm")
+            self.EmbedProject = keras.layers.Dense(self.config.hidden_size, name='EmbedProject')
 
     def build(self, input_shape=None):
         with tf.name_scope("word_embeddings"):
@@ -192,13 +180,79 @@ class PFFBertEmbeddings(keras.layers.Layer):
             with tf.name_scope(self.EmbedProject.name):
                 self.EmbedProject.build([None, None, self.factorized_size])
 
-    def shrink(self):
-        import cudf, cuml
-        condense_df = cudf.DataFrame(self.weight.numpy())
+    def extend_position_embeddings(self, new_size=4096):
+
+        delta = new_size - self.config.max_position_embeddings
+        self.config.max_position_embeddings = new_size
+
+        initializer = get_initializer()
+        
+        current_pos = self.position_embeddings
+        larger_pos = tf.concat([
+            current_pos,
+            initializer([delta, self.hidden_size])
+        ], axis=0)
+
+        delattr(self, 'position_embeddings')
+
+        with tf.name_scope("position_embeddings"):
+            self.position_embeddings = self.add_weight(
+                name="embeddings",
+                shape=[self.max_position_embeddings, self.hidden_size],
+                initializer=get_initializer(self.initializer_range),
+            )
+
+        self.position_embeddings = larger_pos
+
+        return None
+
+    def shrink(self, weights=None):
+        import cupy, cuml
+
+        to_shrink = self.weight.numpy() # if weights is None else weights
+        
+        condense_array = cupy.array(to_shrink, copy=False)
         dim_r = cuml.UMAP(n_neighbors=100, n_components=self.factorized_size)
-        factorized_embeddings = dim_r.fit_transform(condense_df)
-        prepared_embeddings = tf.Variable(factorized_embeddings.to_numpy())
+        factorized_embeddings = dim_r.fit_transform(condense_array)
+        
+        prepared_embeddings = tf.Variable(factorized_embeddings.get())
+
         return prepared_embeddings
+
+    def set_weights_and_shrink(self, weights=None, dim=128):
+
+        if not hasattr(self, "factorized_size"):
+
+            self.factorized_size = dim
+            print(f'factorized size set to {self.factorized_size}')
+            
+            self.FactorNorm = keras.layers.LayerNormalization(epsilon=self.config.layer_norm_eps, name="FactorNorm")
+            self.EmbedProject = keras.layers.Dense(self.hidden_size, name='EmbedProject')
+    
+            with tf.name_scope(self.FactorNorm.name):
+                self.FactorNorm.build([None, None, self.factorized_size])
+            with tf.name_scope(self.EmbedProject.name):
+                self.EmbedProject.build([None, None, self.factorized_size])
+
+        factorized_weights = self.shrink(weights)
+        self.weight = factorized_weights
+
+        return None
+        
+    # TODO
+    # def convert_to_rope(self):
+
+    #     delattr(self, 'position_embeddings')
+
+    #     self.position_embeddings = TFRoFormerSinusoidalPositionalEmbedding(
+    #         config.max_position_embeddings,
+    #         config.hidden_size // config.num_attention_heads,
+    #         name="embed_positions",
+    #     )
+
+    #     if getattr(self, "position_embeddings", None) is not None:
+    #         with tf.name_scope(self.position_embeddings.name):
+    #             self.position_embeddings.build(None)        
 
     def call(
         self,
@@ -235,13 +289,15 @@ class PFFBertEmbeddings(keras.layers.Layer):
                 tf.range(start=past_key_values_length, limit=input_shape[1] + past_key_values_length), axis=0
             )
 
+        # sinusoidal_pos = self.embed_positions(shape_list(hidden_states)[:-1])[None, None, :, :]
+
         position_embeds = tf.gather(params=self.position_embeddings, indices=position_ids)
         token_type_embeds = tf.gather(params=self.token_type_embeddings, indices=token_type_ids)
-        final_embeddings = inputs_embeds + position_embeds + token_type_embeds
+        final_embeddings = inputs_embeds + tf.cast(position_embeds, inputs_embeds.dtype) + tf.cast(token_type_embeds, inputs_embeds.dtype)
         final_embeddings = self.LayerNorm(inputs=final_embeddings)
         final_embeddings = self.dropout(inputs=final_embeddings, training=training)
 
-        return final_embeddings
+        return final_embeddings        
 
 
 class PFFBertLayer(keras.layers.Layer):
@@ -449,16 +505,64 @@ class PFFBertEncoder(keras.layers.Layer):
         if getattr(self, "layer_0", None) is not None:
             with tf.name_scope(self.layer_0.name):
               self.layer_0.build(None)
-              # self.layer_0.attention.set_weights(self.layer[0].attention)
               self.layer_0.attention.set_weights(self.layer[0].attention.weights)
               del_layer = self.layer.pop(0)
               self.layer.insert(0, self.layer_0)
-
-              # self.layer[0] = self.layer_0
               delattr(self, "layer_0")
-              # del self.layer_0
-
               del del_layer
+
+    def expand_ff(self, desired_size=2048):
+        # https://arxiv.org/pdf/2308.06103.pdf
+
+        hidden_size = self.config.hidden_size
+        intermediate_size = self.config.intermediate_size
+        
+        p_delta = desired_size - intermediate_size
+        self.config.intermediate_size = desired_size
+
+        initializer = get_initializer() # tf.keras.initializers.GlorotNormal(seed=desired_size)
+
+        new_weights = [
+            tf.concat([
+                self.intermediate.weights[0],
+                initializer([hidden_size, p_delta])
+            ], axis=1),
+            tf.concat([
+                self.intermediate.weights[1],
+                initializer([p_delta])
+            ], axis=0)
+        ]
+
+        delattr(self, 'intermediate')
+        self.intermediate = TFBertIntermediate(self.config, name="intermediate")
+        with tf.name_scope(self.intermediate.name):
+              self.intermediate.build(None)
+            
+        self.intermediate.set_weights(new_weights)
+
+        new_weights = [
+            tf.concat([
+                self.bert_output.weights[0],
+                initializer([p_delta, hidden_size])
+            ], axis=0),
+            # tf.concat([
+            #     self.bert_output.weights[1],
+            #     tf.zeros(p_delta)
+            # ], axis=0),
+            *self.bert_output.weights[1:]
+        ]
+
+        delattr(self, 'bert_output')
+        self.bert_output = TFBertOutput(self.config, name="output")
+        with tf.name_scope(self.bert_output.name):
+              self.bert_output.build(None)
+        
+        self.bert_output.set_weights(new_weights)
+
+        # what about layernorm?
+
+        return None
+    
     
     # A bit cleaner but eh...
     # def build(self, input_shape=None):
@@ -500,8 +604,9 @@ class PFFBertMainLayer(keras.layers.Layer):
         return self.embeddings
 
     def set_input_embeddings(self, value: tf.Variable):
-        self.embeddings.weight = value
-        self.embeddings.vocab_size = shape_list(value)[0]
+        if value is not None:
+            self.embeddings.weight = value
+            self.embeddings.vocab_size = shape_list(value)[0]
 
     def _prune_heads(self, heads_to_prune):
         """
@@ -675,7 +780,7 @@ class PFFBertMainLayer(keras.layers.Layer):
         if getattr(self, "embeddings", None) is not None:
             with tf.name_scope(self.embeddings.name):
                 self.embeddings.build(None)
-                if self.config.get('factorized_size'):
+                if self.config.__dict__.get('factorized_size'):
                     factorized_weights = self.embeddings.shrink()
                     self.set_input_embeddings(factorized_weights)
         if getattr(self, "encoder", None) is not None:
@@ -881,85 +986,221 @@ BERT_INPUTS_DOCSTRING = r"""
 """
 
 
-# @add_start_docstrings(
-#     "The bare Bert Model transformer outputting raw hidden-states without any specific head on top.",
-#     BERT_START_DOCSTRING,
-# )
-# class PFFBertModel(PFFBertPreTrainedModel):
-#     def __init__(self, config: BertConfig, *inputs, **kwargs):
-#         super().__init__(config, *inputs, **kwargs)
+@add_start_docstrings(
+    "The bare Bert Model transformer outputting raw hidden-states without any specific head on top.",
+    BERT_START_DOCSTRING,
+)
+class PFFBertModel(PFFBertPreTrainedModel):
+    def __init__(self, config: BertConfig, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
 
-#         self.bert = PFFBertMainLayer(config, name="bert")
+        self.bert = PFFBertMainLayer(config, name="bert")
 
-#     @unpack_inputs
-#     @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
-#     @add_code_sample_docstrings(
-#         checkpoint=_CHECKPOINT_FOR_DOC,
-#         output_type=TFBaseModelOutputWithPoolingAndCrossAttentions,
-#         config_class=_CONFIG_FOR_DOC,
-#     )
-#     def call(
-#         self,
-#         input_ids: TFModelInputType | None = None,
-#         attention_mask: np.ndarray | tf.Tensor | None = None,
-#         token_type_ids: np.ndarray | tf.Tensor | None = None,
-#         position_ids: np.ndarray | tf.Tensor | None = None,
-#         head_mask: np.ndarray | tf.Tensor | None = None,
-#         inputs_embeds: np.ndarray | tf.Tensor | None = None,
-#         encoder_hidden_states: np.ndarray | tf.Tensor | None = None,
-#         encoder_attention_mask: np.ndarray | tf.Tensor | None = None,
-#         past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
-#         use_cache: Optional[bool] = None,
-#         output_attentions: Optional[bool] = None,
-#         output_hidden_states: Optional[bool] = None,
-#         return_dict: Optional[bool] = None,
-#         training: Optional[bool] = False,
-#     ) -> Union[TFBaseModelOutputWithPoolingAndCrossAttentions, Tuple[tf.Tensor]]:
-#         r"""
-#         encoder_hidden_states  (`tf.Tensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-#             Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention if
-#             the model is configured as a decoder.
-#         encoder_attention_mask (`tf.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-#             Mask to avoid performing attention on the padding token indices of the encoder input. This mask is used in
-#             the cross-attention if the model is configured as a decoder. Mask values selected in `[0, 1]`:
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=TFBaseModelOutputWithPoolingAndCrossAttentions,
+        config_class=_CONFIG_FOR_DOC,
+    )
+    def call(
+        self,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        encoder_hidden_states: np.ndarray | tf.Tensor | None = None,
+        encoder_attention_mask: np.ndarray | tf.Tensor | None = None,
+        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        training: Optional[bool] = False,
+    ) -> Union[TFBaseModelOutputWithPoolingAndCrossAttentions, Tuple[tf.Tensor]]:
+        r"""
+        encoder_hidden_states  (`tf.Tensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+            Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention if
+            the model is configured as a decoder.
+        encoder_attention_mask (`tf.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Mask to avoid performing attention on the padding token indices of the encoder input. This mask is used in
+            the cross-attention if the model is configured as a decoder. Mask values selected in `[0, 1]`:
 
-#             - 1 for tokens that are **not masked**,
-#             - 0 for tokens that are **masked**.
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
 
-#         past_key_values (`Tuple[Tuple[tf.Tensor]]` of length `config.n_layers`)
-#             contains precomputed key and value hidden states of the attention blocks. Can be used to speed up decoding.
-#             If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those that
-#             don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
-#             `decoder_input_ids` of shape `(batch_size, sequence_length)`.
-#         use_cache (`bool`, *optional*, defaults to `True`):
-#             If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
-#             `past_key_values`). Set to `False` during training, `True` during generation
-#         """
-#         outputs = self.bert(
-#             input_ids=input_ids,
-#             attention_mask=attention_mask,
-#             token_type_ids=token_type_ids,
-#             position_ids=position_ids,
-#             head_mask=head_mask,
-#             inputs_embeds=inputs_embeds,
-#             encoder_hidden_states=encoder_hidden_states,
-#             encoder_attention_mask=encoder_attention_mask,
-#             past_key_values=past_key_values,
-#             use_cache=use_cache,
-#             output_attentions=output_attentions,
-#             output_hidden_states=output_hidden_states,
-#             return_dict=return_dict,
-#             training=training,
-#         )
-#         return outputs
+        past_key_values (`Tuple[Tuple[tf.Tensor]]` of length `config.n_layers`)
+            contains precomputed key and value hidden states of the attention blocks. Can be used to speed up decoding.
+            If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those that
+            don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
+            `decoder_input_ids` of shape `(batch_size, sequence_length)`.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
+            `past_key_values`). Set to `False` during training, `True` during generation
+        """
+        outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+        return outputs
 
-#     def build(self, input_shape=None):
-#         if self.built:
-#             return
-#         self.built = True
-#         if getattr(self, "bert", None) is not None:
-#             with tf.name_scope(self.bert.name):
-#                 self.bert.build(None)
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "bert", None) is not None:
+            with tf.name_scope(self.bert.name):
+                self.bert.build(None)
+        
+
+class PFFBertModelForHeadless(PFFBertPreTrainedModel):
+    def __init__(self, config: BertConfig, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+
+        import keras_nlp
+        from transformers import AutoTokenizer
+
+        self.bert = PFFBertMainLayer(config, name="bert")
+        self.emb_predictor = tf.keras.layers.Identity()
+        
+        self.mask_token_id = -100
+
+        self.tokenizer = AutoTokenizer.from_pretrained(config._name_or_path)
+        
+        self.masker = tf.function()(keras_nlp.layers.MaskedLMMaskGenerator(
+            vocabulary_size=len(self.tokenizer.vocab),
+            mask_selection_rate=0.1, # 0.1 ?
+            mask_token_id=self.mask_token_id,
+            mask_selection_length=None # 1?
+        ))
+
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=TFBaseModelOutputWithPoolingAndCrossAttentions,
+        config_class=_CONFIG_FOR_DOC,
+    )
+    def call(
+        self,
+        mask,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        encoder_hidden_states: np.ndarray | tf.Tensor | None = None,
+        encoder_attention_mask: np.ndarray | tf.Tensor | None = None,
+        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        training: Optional[bool] = False,
+    ) -> Union[TFBaseModelOutputWithPoolingAndCrossAttentions, Tuple[tf.Tensor]]:
+        r"""
+        encoder_hidden_states  (`tf.Tensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+            Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention if
+            the model is configured as a decoder.
+        encoder_attention_mask (`tf.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Mask to avoid performing attention on the padding token indices of the encoder input. This mask is used in
+            the cross-attention if the model is configured as a decoder. Mask values selected in `[0, 1]`:
+
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
+
+        past_key_values (`Tuple[Tuple[tf.Tensor]]` of length `config.n_layers`)
+            contains precomputed key and value hidden states of the attention blocks. Can be used to speed up decoding.
+            If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those that
+            don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
+            `decoder_input_ids` of shape `(batch_size, sequence_length)`.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
+            `past_key_values`). Set to `False` during training, `True` during generation
+        """
+        outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+                
+        last_hidden_state = tf.gather_nd(outputs['last_hidden_state'], mask)
+        emb_prediction = self.emb_predictor(last_hidden_state)
+
+        return emb_prediction
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "bert", None) is not None:
+            with tf.name_scope(self.bert.name):
+                self.bert.build(None)
+
+    def set_weights_and_shrink(self, weights=None, dim=128):
+
+        self.bert.set_input_embeddings(weights)
+
+        if not hasattr(self, "factorized_size"):
+
+            setattr(self.bert.embeddings, "factorized_size", dim)
+            print(f'factorized size set to {self.factorized_size}')
+            
+            self.bert.embeddings.FactorNorm = keras.layers.LayerNormalization(epsilon=self.config.layer_norm_eps, name="FactorNorm")
+            self.bert.embeddings.EmbedProject = keras.layers.Dense(self.config.hidden_size, name='EmbedProject')
+    
+            with tf.name_scope(self.bert.embeddings.FactorNorm.name):
+                self.bert.embeddings.FactorNorm.build([None, None, self.factorized_size])
+            with tf.name_scope(self.bert.embeddings.EmbedProject.name):
+                self.bert.embeddings.EmbedProject.build([None, None, self.factorized_size])
+
+        factorized_weights = self.bert.embeddings.shrink(weights)
+        self.bert.embeddings.weight = factorized_weights
+
+        return None
+
+    def train_step(self, inputs):
+        x, y = self.make_xy(inputs)
+        return super().train_step((x, y))
+
+    def make_xy(self, inputs):
+        tokens = inputs['input_ids']
+        mask_dict = self.masker(tokens)
+        mask = tf.where(mask_dict['token_ids'] == self.mask_token_id)
+
+        embeddings = self.bert.get_input_embeddings()
+        target_input_embeddings = tf.gather_nd(embeddings(tokens), mask)
+
+        inputs['mask'] = mask
+
+        return inputs, target_input_embeddings
 
 
 # @add_start_docstrings(
@@ -1506,7 +1747,7 @@ BERT_INPUTS_DOCSTRING = r"""
 #         self.built = True
 #         if getattr(self, "bert", None) is not None:
 #             with tf.name_scope(self.bert.name):
-#                 self.bert.build(None)
+#                 self.bert.build(None)print(
 #         if getattr(self, "classifier", None) is not None:
 #             with tf.name_scope(self.classifier.name):
 #                 self.classifier.build([None, None, self.config.hidden_size])
