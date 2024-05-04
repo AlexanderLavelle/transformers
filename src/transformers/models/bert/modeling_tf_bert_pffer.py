@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import tensorflow as tf
@@ -35,6 +35,7 @@ from transformers.modeling_tf_utils import (
     keras_serializable,
     unpack_inputs,
 )
+from tensorflow import keras
 from transformers.tf_utils import check_embeddings_within_bounds, shape_list, stable_softmax
 from transformers.utils import (
     ModelOutput,
@@ -69,8 +70,47 @@ from transformers.models.bert.modeling_tf_bert import (
 )
 
 from transformers.models.roformer.modeling_tf_roformer import (
-    TFRoFormerSinusoidalPositionalEmbedding as rope_embeddings
+    TFRoFormerSinusoidalPositionalEmbedding,
+    TFRoFormerAttention
 )
+
+import keras_nlp
+
+
+import inspect
+import warnings
+from typing import Dict, Optional, Union
+
+from packaging.version import parse
+
+from transformers.tf_utils import (
+    expand_1d,
+    shape_list,
+)
+from transformers.utils import (
+    ModelOutput,
+    find_labels,
+    logging,
+)
+
+
+# try:
+#     import tf_keras as keras
+#     from tf_keras import backend as K
+# except (ModuleNotFoundError, ImportError):
+#     import keras
+#     from keras import backend as K
+
+#     if parse(keras.__version__).major > 2:
+#         raise ValueError(
+#             "Your currently installed version of Keras is Keras 3, but this is not yet supported in "
+#             "Transformers. Please install the backwards-compatible tf-keras package with "
+#             "`pip install tf-keras`."
+#         )
+
+
+logger = logging.get_logger(__name__)
+tf_logger = tf.get_logger()
 
 
 logger = logging.get_logger(__name__)
@@ -121,6 +161,20 @@ TF_BERT_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all BERT models at https://huggingface.co/models?filter=bert
 ]
 
+def positional_encoding(length, depth):
+  depth = depth/2
+
+  positions = np.arange(length)[:, np.newaxis]     # (seq, 1)
+  depths = np.arange(depth)[np.newaxis, :]/depth   # (1, depth)
+
+  angle_rates = 1 / (10000**depths)         # (1, depth)
+  angle_rads = positions * angle_rates      # (pos, depth)
+
+  pos_encoding = np.concatenate(
+      [np.sin(angle_rads), np.cos(angle_rads)],
+      axis=-1) 
+
+  return tf.cast(pos_encoding, dtype=eval(f"tf.{keras.mixed_precision.global_policy()._name.split('_')[-1]}"))
 
 
 class PFFBertEmbeddings(keras.layers.Layer):
@@ -140,6 +194,13 @@ class PFFBertEmbeddings(keras.layers.Layer):
             self.factorized_size = kwargs.get('factorized_size')
             self.FactorNorm = keras.layers.LayerNormalization(epsilon=self.config.layer_norm_eps, name="FactorNorm")
             self.EmbedProject = keras.layers.Dense(self.config.hidden_size, name='EmbedProject')
+        else:
+            self.factorized_size=None
+
+        self.position_embeddings = positional_encoding(length=4096, depth=self.config.hidden_size)
+
+        # keras_nlp.layers.SinePositionEncoding(max_wavelength=4096, name='embeddings')
+
 
     def build(self, input_shape=None):
         with tf.name_scope("word_embeddings"):
@@ -160,10 +221,172 @@ class PFFBertEmbeddings(keras.layers.Layer):
                 initializer=get_initializer(self.initializer_range),
             )
 
+        # with tf.name_scope("position_embeddings"):
+            # # self.position_embeddings = keras_nlp.layers.SinePositionEncoding(max_wavelength=4096, name='embeddings')
+            # # self.position_embeddings.trainable = False  # Freeze the layer
+            
+            # self.position_embeddings = self.add_weight(
+            #     name="embeddings",
+            #     shape=[self.max_position_embeddings, self.hidden_size],
+            #     initializer=get_initializer(self.initializer_range),
+            # )
+
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "LayerNorm", None) is not None:
+            with tf.name_scope(self.LayerNorm.name):
+                self.LayerNorm.build([None, None, self.config.hidden_size])
+        
+        if getattr(self, "factorized_size", None) is not None:
+            with tf.name_scope(self.FactorNorm.name):
+                self.FactorNorm.build([None, None, self.factorized_size])
+            with tf.name_scope(self.EmbedProject.name):
+                self.EmbedProject.build([None, None, self.factorized_size])
+
+    def extend_position_embeddings(self, new_size=4096):
+
+        delta = new_size - self.config.max_position_embeddings
+        self.config.max_position_embeddings = new_size
+
+        initializer = get_initializer()
+        
+        current_pos = self.position_embeddings
+        larger_pos = tf.concat([
+            current_pos,
+            initializer([delta, self.hidden_size])
+        ], axis=0)
+
+        delattr(self, 'position_embeddings')
+
         with tf.name_scope("position_embeddings"):
             self.position_embeddings = self.add_weight(
                 name="embeddings",
                 shape=[self.max_position_embeddings, self.hidden_size],
+                initializer=get_initializer(self.initializer_range),
+            )
+
+        self.position_embeddings = larger_pos
+
+        return None
+
+    def shrink(self, weights=None):
+        import cupy, cuml
+
+        to_shrink = self.weight.numpy() # if weights is None else weights
+        
+        condense_array = cupy.array(to_shrink, copy=False)
+        dim_r = cuml.UMAP(n_neighbors=100, n_components=self.factorized_size)
+        factorized_embeddings = dim_r.fit_transform(condense_array)
+        
+        prepared_embeddings = tf.Variable(factorized_embeddings.get())
+
+        return prepared_embeddings
+
+    def set_weights_and_shrink(self, weights=None, dim=128):
+
+        if not hasattr(self, "factorized_size") or not getattr(self, "factorized_size"):
+
+            self.factorized_size = dim
+            print(f'factorized size set to {self.factorized_size}')
+            
+            self.FactorNorm = keras.layers.LayerNormalization(epsilon=self.config.layer_norm_eps, name="FactorNorm")
+            self.EmbedProject = keras.layers.Dense(self.hidden_size, name='EmbedProject')
+    
+            with tf.name_scope(self.FactorNorm.name):
+                self.FactorNorm.build([None, None, self.factorized_size])
+            with tf.name_scope(self.EmbedProject.name):
+                self.EmbedProject.build([None, None, self.factorized_size])
+
+        factorized_weights = self.shrink(weights)
+        self.weight = factorized_weights
+
+        return None
+
+    def call(
+        self,
+        input_ids: tf.Tensor = None,
+        position_ids: tf.Tensor = None,
+        token_type_ids: tf.Tensor = None,
+        inputs_embeds: tf.Tensor = None,
+        past_key_values_length=0,
+        training: bool = False,
+    ) -> tf.Tensor:
+        """
+        Applies embedding based on inputs tensor.
+
+        Returns:
+            final_embeddings (`tf.Tensor`): output embedding tensor.
+        """
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("Need to provide either `input_ids` or `input_embeds`.")
+
+        if input_ids is not None:
+            check_embeddings_within_bounds(input_ids, self.config.vocab_size)
+            inputs_embeds = tf.gather(params=self.weight, indices=input_ids)
+
+            if self.factorized_size:
+                inputs_embeds = self.EmbedProject(self.FactorNorm(inputs_embeds))
+
+        input_shape = shape_list(inputs_embeds)[:-1]
+
+        if token_type_ids is None:
+            token_type_ids = tf.fill(dims=input_shape, value=0)
+
+        # if position_ids is None:
+        #     position_ids = tf.expand_dims(
+        #         tf.range(start=past_key_values_length, limit=input_shape[1] + past_key_values_length), axis=0
+        #     )
+
+        # sinusoidal_pos = self.embed_positions(shape_list(hidden_states)[:-1])[None, None, :, :]
+
+        # position_embeds = tf.gather(params=self.position_embeddings, indices=position_ids)
+        position_embeds = self.position_embeddings[tf.newaxis, :input_shape[1], :] 
+        token_type_embeds = tf.gather(params=self.token_type_embeddings, indices=token_type_ids)
+        final_embeddings = inputs_embeds + tf.cast(position_embeds, inputs_embeds.dtype) + tf.cast(token_type_embeds, inputs_embeds.dtype)
+        final_embeddings = self.LayerNorm(inputs=final_embeddings)
+        final_embeddings = self.dropout(inputs=final_embeddings, training=training)
+
+        return final_embeddings      
+
+
+class PFFRoFormerEmbeddings(keras.layers.Layer):
+    """Construct the embeddings from word, position and token_type embeddings."""
+
+    def __init__(self, config: BertConfig, **kwargs):
+        super().__init__(**kwargs)
+
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.max_position_embeddings = config.max_position_embeddings
+        self.initializer_range = config.initializer_range
+        self.LayerNorm = keras.layers.LayerNormalization(epsilon=self.config.layer_norm_eps, name="LayerNorm")
+        self.dropout = keras.layers.Dropout(rate=self.config.hidden_dropout_prob)
+
+        if kwargs.get('factorized_size'):
+            self.factorized_size = kwargs.get('factorized_size')
+            self.FactorNorm = keras.layers.LayerNormalization(epsilon=self.config.layer_norm_eps, name="FactorNorm")
+            self.EmbedProject = keras.layers.Dense(self.config.hidden_size, name='EmbedProject')
+        else:
+            self.factorized_size=None
+
+
+    def build(self, input_shape=None):
+        with tf.name_scope("word_embeddings"):
+            self.weight = self.add_weight(
+                name="weight",
+                shape=(
+                    [self.config.vocab_size, self.hidden_size]
+                    # if not self.factorized_size 
+                    # else [self.config.vocab_size, self.factorized_size]
+                ),
+                initializer=get_initializer(self.initializer_range),
+            )
+
+        with tf.name_scope("token_type_embeddings"):
+            self.token_type_embeddings = self.add_weight(
+                name="embeddings",
+                shape=[self.config.type_vocab_size, self.hidden_size],
                 initializer=get_initializer(self.initializer_range),
             )
 
@@ -221,7 +444,7 @@ class PFFBertEmbeddings(keras.layers.Layer):
 
     def set_weights_and_shrink(self, weights=None, dim=128):
 
-        if not hasattr(self, "factorized_size"):
+        if not hasattr(self, "factorized_size") or not getattr(self, "factorized_size"):
 
             self.factorized_size = dim
             print(f'factorized size set to {self.factorized_size}')
@@ -238,21 +461,6 @@ class PFFBertEmbeddings(keras.layers.Layer):
         self.weight = factorized_weights
 
         return None
-        
-    # TODO
-    # def convert_to_rope(self):
-
-    #     delattr(self, 'position_embeddings')
-
-    #     self.position_embeddings = TFRoFormerSinusoidalPositionalEmbedding(
-    #         config.max_position_embeddings,
-    #         config.hidden_size // config.num_attention_heads,
-    #         name="embed_positions",
-    #     )
-
-    #     if getattr(self, "position_embeddings", None) is not None:
-    #         with tf.name_scope(self.position_embeddings.name):
-    #             self.position_embeddings.build(None)        
 
     def call(
         self,
@@ -284,20 +492,21 @@ class PFFBertEmbeddings(keras.layers.Layer):
         if token_type_ids is None:
             token_type_ids = tf.fill(dims=input_shape, value=0)
 
-        if position_ids is None:
-            position_ids = tf.expand_dims(
-                tf.range(start=past_key_values_length, limit=input_shape[1] + past_key_values_length), axis=0
-            )
+        # if position_ids is None:
+        #     position_ids = tf.expand_dims(
+        #         tf.range(start=past_key_values_length, limit=input_shape[1] + past_key_values_length), axis=0
+        #     )
 
         # sinusoidal_pos = self.embed_positions(shape_list(hidden_states)[:-1])[None, None, :, :]
 
-        position_embeds = tf.gather(params=self.position_embeddings, indices=position_ids)
+        # position_embeds = tf.gather(params=self.position_embeddings, indices=position_ids)
+        # position_embeds = self.position_embeddings[tf.newaxis, :input_shape[1], :] 
         token_type_embeds = tf.gather(params=self.token_type_embeddings, indices=token_type_ids)
-        final_embeddings = inputs_embeds + tf.cast(position_embeds, inputs_embeds.dtype) + tf.cast(token_type_embeds, inputs_embeds.dtype)
+        final_embeddings = inputs_embeds + tf.cast(token_type_embeds, inputs_embeds.dtype)
         final_embeddings = self.LayerNorm(inputs=final_embeddings)
         final_embeddings = self.dropout(inputs=final_embeddings, training=training)
 
-        return final_embeddings        
+        return final_embeddings      
 
 
 class PFFBertLayer(keras.layers.Layer):
@@ -404,6 +613,152 @@ class PFFBertLayer(keras.layers.Layer):
                 self.crossattention.build(None)
 
 
+class PFFRoFormerEncoderLayer(keras.layers.Layer):
+    def __init__(self, config: BertConfig, **kwargs):
+        super().__init__(**kwargs)
+
+        self.attention = TFRoFormerAttention(config, name="attention")
+        self.is_decoder = config.is_decoder
+        self.add_cross_attention = config.add_cross_attention
+        if self.add_cross_attention:
+            raise NotImplementedError("Cross attention not implemented")
+            # if not self.is_decoder:
+            #     raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
+            # self.crossattention = TFBertAttention(config, name="crossattention")
+
+    def call(
+        self,
+        hidden_states: tf.Tensor,
+        attention_mask: tf.Tensor,
+        sinusoidal_pos: tf.Tensor,
+        head_mask: tf.Tensor,
+        output_attentions: bool,
+        training: bool = False,
+     ) -> Tuple[tf.Tensor]:
+         
+        # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
+        # self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
+
+        attention_outputs = self.attention(
+            input_tensor=hidden_states,
+            attention_mask=attention_mask,
+            sinusoidal_pos=sinusoidal_pos,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            training=training,
+        )
+
+        # attention_output = self_attention_outputs[0]
+
+        # if decoder, the last output is tuple of self-attn cache
+        if self.is_decoder:
+            outputs = self_attention_outputs[1:-1]
+            present_key_value = self_attention_outputs[-1]
+        else:
+            outputs = attention_outputs # (attention_output, self_attention_outputs[1:])  # add self attentions if we output attention weights
+
+        # cross_attn_present_key_value = None
+        # if self.is_decoder and encoder_hidden_states is not None:
+        #     if not hasattr(self, "crossattention"):
+        #         raise ValueError(
+        #             f"If `encoder_hidden_states` are passed, {self} has to be instantiated with cross-attention layers"
+        #             " by setting `config.add_cross_attention=True`"
+        #         )
+
+        #     # cross_attn cached key/values tuple is at positions 3,4 of past_key_value tuple
+        #     cross_attn_past_key_value = past_key_value[-2:] if past_key_value is not None else None
+        #     cross_attention_outputs = self.crossattention(
+        #         input_tensor=attention_output,
+        #         attention_mask=attention_mask,
+        #         head_mask=head_mask,
+        #         encoder_hidden_states=encoder_hidden_states,
+        #         encoder_attention_mask=encoder_attention_mask,
+        #         past_key_value=cross_attn_past_key_value,
+        #         output_attentions=output_attentions,
+        #         training=training,
+        #     )
+        #     attention_output = cross_attention_outputs[0]
+        #     outputs = outputs + cross_attention_outputs[1:-1]  # add cross attentions if we output attention weights
+
+        #     # add cross-attn cache to positions 3,4 of present_key_value tuple
+        #     cross_attn_present_key_value = cross_attention_outputs[-1]
+        #     present_key_value = present_key_value + cross_attn_present_key_value
+
+        ########################################################################################
+        # intermediate_output = self.intermediate(hidden_states=attention_output)
+        # layer_output = self.bert_output(
+        #     hidden_states=intermediate_output, input_tensor=attention_output, training=training
+        # )
+        # outputs = (layer_output,) + outputs  # add attentions if we output them
+        ########################################################################################
+
+        # if decoder, return the attn key/values as the last output
+        if self.is_decoder:
+            outputs = outputs + (present_key_value,)
+
+        return outputs
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "attention", None) is not None:
+            with tf.name_scope(self.attention.name):
+                self.attention.build(None)
+        if getattr(self, "intermediate", None) is not None:
+            with tf.name_scope(self.intermediate.name):
+                self.intermediate.build(None)
+        if getattr(self, "bert_output", None) is not None:
+            with tf.name_scope(self.bert_output.name):
+                self.bert_output.build(None)
+        if getattr(self, "crossattention", None) is not None:
+            with tf.name_scope(self.crossattention.name):
+                self.crossattention.build(None)
+
+
+class PFFBertIntermediate(TFBertIntermediate):
+    def __init__(self, config: BertConfig, **kwargs):
+        super().__init__(config, **kwargs)
+
+    def dense_zeros(self, hs_chunk):
+        # would be interesting to avoid dense over 0s
+        return None
+
+    def call(self, hidden_states: tf.Tensor) -> tf.Tensor:
+
+        shape = tf.shape(hidden_states)
+        splits = tf.reduce_min(10, tf.reduce_max(shape[1] // 10, 1))
+        
+        hidden_states = tf.concat([
+            self.dense(inputs=hs_chunk) 
+            for hs_chunk in tf.split(hidden_states, splits, axis=1)
+        ], axis=1)
+        hidden_states = self.intermediate_act_fn(hidden_states)
+
+        return hidden_states
+
+
+
+
+class PFFBertOutput(TFBertOutput):
+    def __init__(self, config: BertConfig, **kwargs):
+        super().__init__(config, **kwargs)
+
+    def call(self, hidden_states: tf.Tensor, input_tensor: tf.Tensor, training: bool = False) -> tf.Tensor:
+        
+        shape = tf.shape(hidden_states)
+        splits = tf.reduce_min(10, tf.reduce_max(shape[1] // 10, 1))
+
+        hidden_states = tf.concat([
+            self.dense(inputs=hs_chunk) 
+            for hs_chunk in tf.split(hidden_states, splits, axis=1)
+        ], axis=1)
+        hidden_states = self.dropout(inputs=hidden_states, training=training)
+        hidden_states = self.LayerNorm(inputs=hidden_states + input_tensor)
+
+        return hidden_states
+
+
 class PFFBertEncoder(keras.layers.Layer):
     def __init__(self, config: BertConfig, **kwargs):
         super().__init__(**kwargs)
@@ -414,8 +769,8 @@ class PFFBertEncoder(keras.layers.Layer):
         self.layer_0 = PFFBertLayer(config, name=f"layer_._0")
 
         # ff, norm+add
-        self.intermediate = TFBertIntermediate(config, name="intermediate")
-        self.bert_output = TFBertOutput(config, name="output")
+        self.intermediate = PFFBertIntermediate(config, name="intermediate")
+        self.bert_output = PFFBertOutput(config, name="output")
 
     def call(
         self,
@@ -564,6 +919,197 @@ class PFFBertEncoder(keras.layers.Layer):
         return None
     
     
+    
+    # A bit cleaner but eh...
+    # def build(self, input_shape=None):
+    #     if self.built:
+    #         return
+    #     self.built = True
+    #     if getattr(self, "layer", None) is not None:
+    #         for layer in self.layer:
+    #             with tf.name_scope(layer.name):
+    #                 layer.build(None)
+    #     if getattr(self, "intermediate", None) is not None:
+    #         # with tf.name_scope(self.intermediate.name):
+    #         self.intermediate.build(None)
+    #         self.intermediate.set_weights(self.layer[0].intermediate.weights)
+    #     if getattr(self, "layer_0", None) is not None:
+    #         with tf.name_scope(self.layer_0.name):
+    #           self.layer_0.build(None)
+    #           # self.layer_0.attention.set_weights(self.layer[0].attention)
+    #           self.layer_0.attention.set_weights(self.layer[0].attention.weights)
+    #           self.layer[0] = self.layer_0
+    #           delattr(self, "layer_0")
+
+
+class PFFRoFormerEncoder(keras.layers.Layer):
+    def __init__(self, config: BertConfig, **kwargs):
+        super().__init__(**kwargs)
+        self.config = config
+
+        self.embed_positions = TFRoFormerSinusoidalPositionalEmbedding(
+            4096, # config.max_position_embeddings,
+            config.hidden_size // config.num_attention_heads,
+            name="embed_positions",
+        )
+
+        # attention layers
+        self.layer = [TFBertLayer(config, name=f"layer_._0")] + [PFFRoFormerEncoderLayer(config, name=f"layer_._{i}") for i in range(1, config.num_hidden_layers-1)]
+        self.layer_0 = PFFRoFormerEncoderLayer(config, name=f"layer_._0")
+
+        # ff, norm+add
+        self.intermediate = PFFBertIntermediate(config, name="intermediate")
+        self.bert_output = PFFBertOutput(config, name="output")
+
+    def call(
+        self,
+        hidden_states: tf.Tensor,
+        attention_mask: tf.Tensor,
+        head_mask: tf.Tensor,
+        encoder_hidden_states: tf.Tensor | None,
+        encoder_attention_mask: tf.Tensor | None,
+        past_key_values: Tuple[Tuple[tf.Tensor]] | None,
+        use_cache: Optional[bool],
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+        training: bool = False,
+    ) -> Union[TFBaseModelOutputWithPastAndCrossAttentions, Tuple[tf.Tensor]]:
+        all_hidden_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+        all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
+
+        next_decoder_cache = () if use_cache else None
+        # Where we call each block in the blocks
+
+        # [sequence_length, embed_size_per_head] -> [batch_size, num_heads, sequence_length, embed_size_per_head]
+        sinusoidal_pos = self.embed_positions(shape_list(hidden_states)[:-1])[None, None, :, :]
+        
+        for i, layer_module in enumerate(self.layer):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            past_key_value = past_key_values[i] if past_key_values is not None else None
+
+            layer_outputs = layer_module(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                head_mask=head_mask[i],
+                sinusoidal_pos=sinusoidal_pos,
+                output_attentions=output_attentions,
+                training=training,
+            )
+            hidden_states = layer_outputs[0]
+            
+            # This is where we need to pff
+            intermediate_output = self.intermediate(hidden_states=hidden_states) 
+            hidden_states = self.bert_output(
+                hidden_states=intermediate_output, input_tensor=hidden_states, training=training
+            )
+
+            if use_cache:
+                next_decoder_cache += (layer_outputs[-1],)
+
+            if output_attentions:
+                all_attentions = all_attentions + (layer_outputs[1],)
+                if self.config.add_cross_attention and encoder_hidden_states is not None:
+                    all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
+
+        # Add last layer
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if not return_dict:
+            return tuple(
+                v for v in [hidden_states, all_hidden_states, all_attentions, all_cross_attentions] if v is not None
+            )
+
+        return TFBaseModelOutputWithPastAndCrossAttentions(
+            last_hidden_state=hidden_states,
+            past_key_values=next_decoder_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            cross_attentions=all_cross_attentions,
+        )
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "layer", None) is not None:
+            for layer in self.layer:
+                with tf.name_scope(layer.name):
+                    layer.build(None)
+        if getattr(self, "intermediate", None) is not None:
+            with tf.name_scope(self.intermediate.name):
+              self.intermediate.build(None)
+              self.intermediate.set_weights(self.layer[0].intermediate.weights)
+        if getattr(self, "bert_output", None) is not None:
+            with tf.name_scope(self.bert_output.name):
+              self.bert_output.build(None)
+              self.bert_output.set_weights(self.layer[0].bert_output.weights)
+        if getattr(self, "layer_0", None) is not None:
+            with tf.name_scope(self.layer_0.name):
+              self.layer_0.build(None)
+              self.layer_0.attention.set_weights(self.layer[0].attention.weights)
+              del_layer = self.layer.pop(0)
+              self.layer.insert(0, self.layer_0)
+              delattr(self, "layer_0")
+              del del_layer
+
+    def expand_ff(self, desired_size=2048):
+        # https://arxiv.org/pdf/2308.06103.pdf
+
+        hidden_size = self.config.hidden_size
+        intermediate_size = self.config.intermediate_size
+        
+        p_delta = desired_size - intermediate_size
+        self.config.intermediate_size = desired_size
+
+        initializer = get_initializer() # tf.keras.initializers.GlorotNormal(seed=desired_size)
+
+        new_weights = [
+            tf.concat([
+                self.intermediate.weights[0],
+                initializer([hidden_size, p_delta])
+            ], axis=1),
+            tf.concat([
+                self.intermediate.weights[1],
+                initializer([p_delta])
+            ], axis=0)
+        ]
+
+        delattr(self, 'intermediate')
+        self.intermediate = TFBertIntermediate(self.config, name="intermediate")
+        with tf.name_scope(self.intermediate.name):
+              self.intermediate.build(None)
+            
+        self.intermediate.set_weights(new_weights)
+
+        new_weights = [
+            tf.concat([
+                self.bert_output.weights[0],
+                initializer([p_delta, hidden_size])
+            ], axis=0),
+            # tf.concat([
+            #     self.bert_output.weights[1],
+            #     tf.zeros(p_delta)
+            # ], axis=0),
+            *self.bert_output.weights[1:]
+        ]
+
+        delattr(self, 'bert_output')
+        self.bert_output = TFBertOutput(self.config, name="output")
+        with tf.name_scope(self.bert_output.name):
+              self.bert_output.build(None)
+        
+        self.bert_output.set_weights(new_weights)
+
+        # what about layernorm?
+
+        return None
+    
+    
     # A bit cleaner but eh...
     # def build(self, input_shape=None):
     #     if self.built:
@@ -598,7 +1144,8 @@ class PFFBertMainLayer(keras.layers.Layer):
 
         self.embeddings = PFFBertEmbeddings(config, name="embeddings")
         self.encoder = PFFBertEncoder(config, name="encoder")
-        self.pooler = TFBertPooler(config, name="pooler") if add_pooling_layer else None
+        # Eh, gpu size savings
+        self.pooler = tf.keras.layers.Identity() # TFBertPooler(config, name="pooler") if add_pooling_layer else None
 
     def get_input_embeddings(self) -> keras.layers.Layer:
         return self.embeddings
@@ -756,7 +1303,8 @@ class PFFBertMainLayer(keras.layers.Layer):
         )
 
         sequence_output = encoder_outputs[0]
-        pooled_output = self.pooler(hidden_states=sequence_output) if self.pooler is not None else None
+        # Commenting or none-ing a lot just because of GPU size...
+        # pooled_output = self.pooler(hidden_states=sequence_output) if self.pooler is not None else None
 
         if not return_dict:
             return (
@@ -766,11 +1314,218 @@ class PFFBertMainLayer(keras.layers.Layer):
 
         return TFBaseModelOutputWithPoolingAndCrossAttentions(
             last_hidden_state=sequence_output,
-            pooler_output=pooled_output,
-            past_key_values=encoder_outputs.past_key_values,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
-            cross_attentions=encoder_outputs.cross_attentions,
+            pooler_output=None, # pooled_output,
+            past_key_values=None, # encoder_outputs.past_key_values,
+            hidden_states=None, # encoder_outputs.hidden_states,
+            attentions=None, # encoder_outputs.attentions,
+            cross_attentions=None, # encoder_outputs.cross_attentions,
+        )
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "embeddings", None) is not None:
+            with tf.name_scope(self.embeddings.name):
+                self.embeddings.build(None)
+                if self.config.__dict__.get('factorized_size'):
+                    factorized_weights = self.embeddings.shrink()
+                    self.set_input_embeddings(factorized_weights)
+        if getattr(self, "encoder", None) is not None:
+            with tf.name_scope(self.encoder.name):
+                self.encoder.build(None)
+        if getattr(self, "pooler", None) is not None:
+            with tf.name_scope(self.pooler.name):
+                self.pooler.build(None)
+
+
+@keras_serializable
+class PFFRoFormerMainLayer(keras.layers.Layer):
+    config_class = BertConfig
+
+    def __init__(self, config: BertConfig, add_pooling_layer: bool = True, **kwargs):
+        super().__init__(**kwargs)
+
+        self.config = config
+        self.is_decoder = config.is_decoder
+
+        self.embeddings = PFFRoFormerEmbeddings(config, name="embeddings")
+        self.encoder = PFFRoFormerEncoder(config, name="encoder")
+        # Eh, gpu size savings
+        self.pooler = tf.keras.layers.Identity() # TFBertPooler(config, name="pooler") if add_pooling_layer else None
+
+    def get_input_embeddings(self) -> keras.layers.Layer:
+        return self.embeddings
+
+    def set_input_embeddings(self, value: tf.Variable):
+        if value is not None:
+            self.embeddings.weight = value
+            self.embeddings.vocab_size = shape_list(value)[0]
+
+    def _prune_heads(self, heads_to_prune):
+        """
+        Prunes heads of the model. heads_to_prune: dict of {layer_num: list of heads to prune in this layer} See base
+        class PreTrainedModel
+        """
+        raise NotImplementedError
+
+    @unpack_inputs
+    def call(
+        self,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        encoder_hidden_states: np.ndarray | tf.Tensor | None = None,
+        encoder_attention_mask: np.ndarray | tf.Tensor | None = None,
+        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        training: bool = False,
+    ) -> Union[TFBaseModelOutputWithPoolingAndCrossAttentions, Tuple[tf.Tensor]]:
+        if not self.config.is_decoder:
+            use_cache = False
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input_shape = shape_list(input_ids)
+        elif inputs_embeds is not None:
+            input_shape = shape_list(inputs_embeds)[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        batch_size, seq_length = input_shape
+
+        if past_key_values is None:
+            past_key_values_length = 0
+            past_key_values = [None] * len(self.encoder.layer)
+        else:
+            past_key_values_length = shape_list(past_key_values[0][0])[-2]
+
+        if attention_mask is None:
+            attention_mask = tf.fill(dims=(batch_size, seq_length + past_key_values_length), value=1)
+
+        if token_type_ids is None:
+            token_type_ids = tf.fill(dims=input_shape, value=0)
+
+        embedding_output = self.embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            token_type_ids=token_type_ids,
+            inputs_embeds=inputs_embeds,
+            past_key_values_length=past_key_values_length,
+            training=training,
+        )
+
+        # We create a 3D attention mask from a 2D tensor mask.
+        # Sizes are [batch_size, 1, 1, to_seq_length]
+        # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
+        # this attention mask is more simple than the triangular masking of causal attention
+        # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
+        attention_mask_shape = shape_list(attention_mask)
+
+        mask_seq_length = seq_length + past_key_values_length
+        # Copied from `modeling_tf_t5.py`
+        # Provided a padding mask of dimensions [batch_size, mask_seq_length]
+        # - if the model is a decoder, apply a causal mask in addition to the padding mask
+        # - if the model is an encoder, make the mask broadcastable to [batch_size, num_heads, mask_seq_length, mask_seq_length]
+        if self.is_decoder:
+            seq_ids = tf.range(mask_seq_length)
+            causal_mask = tf.less_equal(
+                tf.tile(seq_ids[None, None, :], (batch_size, mask_seq_length, 1)),
+                seq_ids[None, :, None],
+            )
+            causal_mask = tf.cast(causal_mask, dtype=attention_mask.dtype)
+            extended_attention_mask = causal_mask * attention_mask[:, None, :]
+            attention_mask_shape = shape_list(extended_attention_mask)
+            extended_attention_mask = tf.reshape(
+                extended_attention_mask, (attention_mask_shape[0], 1, attention_mask_shape[1], attention_mask_shape[2])
+            )
+            if past_key_values[0] is not None:
+                # attention_mask needs to be sliced to the shape `[batch_size, 1, from_seq_length - cached_seq_length, to_seq_length]
+                extended_attention_mask = extended_attention_mask[:, :, -seq_length:, :]
+        else:
+            extended_attention_mask = tf.reshape(
+                attention_mask, (attention_mask_shape[0], 1, 1, attention_mask_shape[1])
+            )
+
+        # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
+        # masked positions, this operation will create a tensor which is 0.0 for
+        # positions we want to attend and -10000.0 for masked positions.
+        # Since we are adding it to the raw scores before the softmax, this is
+        # effectively the same as removing these entirely.
+        extended_attention_mask = tf.cast(extended_attention_mask, dtype=embedding_output.dtype)
+        one_cst = tf.constant(1.0, dtype=embedding_output.dtype)
+        ten_thousand_cst = tf.constant(-10000.0, dtype=embedding_output.dtype)
+        extended_attention_mask = tf.multiply(tf.subtract(one_cst, extended_attention_mask), ten_thousand_cst)
+
+        # Copied from `modeling_tf_t5.py` with -1e9 -> -10000
+        if self.is_decoder and encoder_attention_mask is not None:
+            # If a 2D ou 3D attention mask is provided for the cross-attention
+            # we need to make broadcastable to [batch_size, num_heads, mask_seq_length, mask_seq_length]
+            # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+            encoder_attention_mask = tf.cast(encoder_attention_mask, dtype=extended_attention_mask.dtype)
+            num_dims_encoder_attention_mask = len(shape_list(encoder_attention_mask))
+            if num_dims_encoder_attention_mask == 3:
+                encoder_extended_attention_mask = encoder_attention_mask[:, None, :, :]
+            if num_dims_encoder_attention_mask == 2:
+                encoder_extended_attention_mask = encoder_attention_mask[:, None, None, :]
+
+            # T5 has a mask that can compare sequence ids, we can simulate this here with this transposition
+            # Cf. https://github.com/tensorflow/mesh/blob/8d2465e9bc93129b913b5ccc6a59aa97abd96ec6/mesh_tensorflow/transformer/transformer_layers.py#L270
+            # encoder_extended_attention_mask = tf.math.equal(encoder_extended_attention_mask,
+            #                                         tf.transpose(encoder_extended_attention_mask, perm=(-1, -2)))
+
+            encoder_extended_attention_mask = (1.0 - encoder_extended_attention_mask) * -10000.0
+        else:
+            encoder_extended_attention_mask = None
+
+        # Prepare head mask if needed
+        # 1.0 in head_mask indicate we keep the head
+        # attention_probs has shape bsz x n_heads x N x N
+        # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
+        # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
+        if head_mask is not None:
+            raise NotImplementedError
+        else:
+            head_mask = [None] * self.config.num_hidden_layers
+
+        encoder_outputs = self.encoder(
+            hidden_states=embedding_output,
+            attention_mask=extended_attention_mask,
+            head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_extended_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+
+        sequence_output = encoder_outputs[0]
+        # Commenting or none-ing a lot just because of GPU size...
+        # pooled_output = self.pooler(hidden_states=sequence_output) if self.pooler is not None else None
+
+        if not return_dict:
+            return (
+                sequence_output,
+                pooled_output,
+            ) + encoder_outputs[1:]
+
+        return TFBaseModelOutputWithPoolingAndCrossAttentions(
+            last_hidden_state=sequence_output,
+            pooler_output=None, # pooled_output,
+            past_key_values=None, # encoder_outputs.past_key_values,
+            hidden_states=None, # encoder_outputs.hidden_states,
+            attentions=None, # encoder_outputs.attentions,
+            cross_attentions=None, # encoder_outputs.cross_attentions,
         )
 
     def build(self, input_shape=None):
@@ -1065,29 +1820,17 @@ class PFFBertModel(PFFBertPreTrainedModel):
         if getattr(self, "bert", None) is not None:
             with tf.name_scope(self.bert.name):
                 self.bert.build(None)
-        
 
-class PFFBertModelForHeadless(PFFBertPreTrainedModel):
+
+@add_start_docstrings(
+    "The bare Bert Model transformer outputting raw hidden-states without any specific head on top.",
+    BERT_START_DOCSTRING,
+)
+class PFFRoFormerModel(PFFBertPreTrainedModel):
     def __init__(self, config: BertConfig, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
 
-        import keras_nlp
-        from transformers import AutoTokenizer
-
-        self.bert = PFFBertMainLayer(config, name="bert")
-        self.emb_predictor = tf.keras.layers.Identity()
-        
-        self.mask_token_id = -100
-
-        self.tokenizer = AutoTokenizer.from_pretrained(config._name_or_path)
-        
-        self.masker = tf.function()(keras_nlp.layers.MaskedLMMaskGenerator(
-            vocabulary_size=len(self.tokenizer.vocab),
-            mask_selection_rate=0.1, # 0.1 ?
-            mask_token_id=self.mask_token_id,
-            mask_selection_length=None # 1?
-        ))
-
+        self.bert = PFFRoFormerMainLayer(config, name="bert")
 
     @unpack_inputs
     @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
@@ -1098,7 +1841,6 @@ class PFFBertModelForHeadless(PFFBertPreTrainedModel):
     )
     def call(
         self,
-        mask,
         input_ids: TFModelInputType | None = None,
         attention_mask: np.ndarray | tf.Tensor | None = None,
         token_type_ids: np.ndarray | tf.Tensor | None = None,
@@ -1150,11 +1892,109 @@ class PFFBertModelForHeadless(PFFBertPreTrainedModel):
             return_dict=return_dict,
             training=training,
         )
+        return outputs
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "bert", None) is not None:
+            with tf.name_scope(self.bert.name):
+                self.bert.build(None)
+        
+
+class PFFBertModelForHeadless(PFFBertPreTrainedModel):
+    def __init__(self, config: BertConfig, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+
+        # super(tf.keras.models.Model, self).__init__()
+
+        from transformers import AutoTokenizer
+
+        # self.bert = PFFBertModel.from_pretrained(config, name="bert").bert
+        self.bert = PFFBertMainLayer(config, name="bert")
+        self.emb_predictor = tf.keras.layers.Identity()
+        
+        self.mask_token_id = -100
+
+        self.tokenizer = AutoTokenizer.from_pretrained(config._name_or_path) # getattr(config, '_name_or_path', config.vocab_size))
+        
+        self.masker = tf.function()(keras_nlp.layers.MaskedLMMaskGenerator(
+            vocabulary_size=len(self.tokenizer.vocab),
+            mask_selection_rate=0.1, # 0.1 ?
+            mask_token_id=self.mask_token_id,
+            mask_selection_length=None # 1?
+        ))
+
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=TFBaseModelOutputWithPoolingAndCrossAttentions,
+        config_class=_CONFIG_FOR_DOC,
+    )
+    def call(
+        self,
+        mask,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        encoder_hidden_states: np.ndarray | tf.Tensor | None = None,
+        encoder_attention_mask: np.ndarray | tf.Tensor | None = None,
+        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        training: Optional[bool] = False,
+    ) -> Dict[int, tf.Tensor]: # Union[TFBaseModelOutputWithPoolingAndCrossAttentions, Tuple[tf.Tensor]]:
+        r"""
+        encoder_hidden_states  (`tf.Tensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+            Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention if
+            the model is configured as a decoder.
+        encoder_attention_mask (`tf.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Mask to avoid performing attention on the padding token indices of the encoder input. This mask is used in
+            the cross-attention if the model is configured as a decoder. Mask values selected in `[0, 1]`:
+
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
+
+        past_key_values (`Tuple[Tuple[tf.Tensor]]` of length `config.n_layers`)
+            contains precomputed key and value hidden states of the attention blocks. Can be used to speed up decoding.
+            If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those that
+            don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
+            `decoder_input_ids` of shape `(batch_size, sequence_length)`.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
+            `past_key_values`). Set to `False` during training, `True` during generation
+        """
+        outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
                 
         last_hidden_state = tf.gather_nd(outputs['last_hidden_state'], mask)
         emb_prediction = self.emb_predictor(last_hidden_state)
 
-        return emb_prediction
+        del outputs
+
+        return {0: emb_prediction}
 
     def build(self, input_shape=None):
         if self.built:
@@ -1190,6 +2030,9 @@ class PFFBertModelForHeadless(PFFBertPreTrainedModel):
         x, y = self.make_xy(inputs)
         return super().train_step((x, y))
 
+    # def compile(self, *args, **kwargs):
+    #     super().compile(*args, **kwargs)
+
     def make_xy(self, inputs):
         tokens = inputs['input_ids']
         mask_dict = self.masker(tokens)
@@ -1200,7 +2043,306 @@ class PFFBertModelForHeadless(PFFBertPreTrainedModel):
 
         inputs['mask'] = mask
 
-        return inputs, target_input_embeddings
+        input_copy = {k:tf.identity(v) for k,v in inputs.items()}
+
+        x = {'mask': mask, **input_copy}
+
+        return x, target_input_embeddings
+
+
+class PFFRoFormerModelForHeadless(PFFBertPreTrainedModel): # , tf.keras.models.Model, self):
+    def __init__(self, config: BertConfig, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+
+        # super(tf.keras.models.Model, self).__init__()
+
+        from transformers import AutoTokenizer
+
+        # self.bert = PFFBertModel.from_pretrained(config, name="bert").bert
+        setattr(config, 'rotary_value', False)
+        self.bert = PFFRoFormerMainLayer(config, name="bert")
+        self.emb_predictor = tf.keras.layers.Identity()
+        
+        self.mask_token_id = -100
+
+        self.tokenizer = AutoTokenizer.from_pretrained(config._name_or_path) # getattr(config, '_name_or_path', config.vocab_size))
+        
+        self.masker = tf.function()(keras_nlp.layers.MaskedLMMaskGenerator(
+            vocabulary_size=len(self.tokenizer.vocab),
+            mask_selection_rate=0.1, # 0.1 ?
+            mask_token_id=self.mask_token_id,
+            mask_selection_length=None # 1?
+        ))
+
+        setattr(config, 'accumulate_steps', tf.constant(2048))
+
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=TFBaseModelOutputWithPoolingAndCrossAttentions,
+        config_class=_CONFIG_FOR_DOC,
+    )
+    def call(
+        self,
+        mask,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        encoder_hidden_states: np.ndarray | tf.Tensor | None = None,
+        encoder_attention_mask: np.ndarray | tf.Tensor | None = None,
+        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        training: Optional[bool] = False,
+    ) -> Dict[int, tf.Tensor]: # Union[TFBaseModelOutputWithPoolingAndCrossAttentions, Tuple[tf.Tensor]]:
+        r"""
+        encoder_hidden_states  (`tf.Tensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+            Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention if
+            the model is configured as a decoder.
+        encoder_attention_mask (`tf.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Mask to avoid performing attention on the padding token indices of the encoder input. This mask is used in
+            the cross-attention if the model is configured as a decoder. Mask values selected in `[0, 1]`:
+
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
+
+        past_key_values (`Tuple[Tuple[tf.Tensor]]` of length `config.n_layers`)
+            contains precomputed key and value hidden states of the attention blocks. Can be used to speed up decoding.
+            If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those that
+            don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
+            `decoder_input_ids` of shape `(batch_size, sequence_length)`.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
+            `past_key_values`). Set to `False` during training, `True` during generation
+        """
+        outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+                
+        last_hidden_state = tf.gather_nd(outputs['last_hidden_state'], mask)
+        emb_prediction = self.emb_predictor(last_hidden_state)
+
+        del outputs
+
+        return {0: emb_prediction}
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "bert", None) is not None:
+            with tf.name_scope(self.bert.name):
+                self.bert.build(None)
+
+    def set_weights_and_shrink(self, weights=None, dim=128):
+
+        self.bert.set_input_embeddings(weights)
+
+        if not hasattr(self, "factorized_size"):
+
+            setattr(self.bert.embeddings, "factorized_size", dim)
+            print(f'factorized size set to {self.factorized_size}')
+            
+            self.bert.embeddings.FactorNorm = keras.layers.LayerNormalization(epsilon=self.config.layer_norm_eps, name="FactorNorm")
+            self.bert.embeddings.EmbedProject = keras.layers.Dense(self.config.hidden_size, name='EmbedProject')
+    
+            with tf.name_scope(self.bert.embeddings.FactorNorm.name):
+                self.bert.embeddings.FactorNorm.build([None, None, self.factorized_size])
+            with tf.name_scope(self.bert.embeddings.EmbedProject.name):
+                self.bert.embeddings.EmbedProject.build([None, None, self.factorized_size])
+
+        factorized_weights = self.bert.embeddings.shrink(weights)
+        self.bert.embeddings.weight = factorized_weights
+
+        return None
+
+    # def train_step(self, inputs):
+    #     x, y = self.make_xy(inputs)
+    #     return super().train_step((x, y))
+
+    def test_step(self, inputs):
+        x, y = self.make_xy(inputs)
+        return super().test_step((x, y))
+
+    def train_step(self, data):
+
+        x, y = self.make_xy(data)
+        data = x,y
+    
+        # We hardcode the most common renamings; models with weirder names can set `self._label_to_output_map`
+        arg_names = list(inspect.signature(self.call).parameters)
+        label_kwargs = find_labels(self.__class__)
+        label_to_output = self.get_label_to_output_name_mapping()
+        output_to_label = {val: key for key, val in label_to_output.items()}
+        if not self._using_dummy_loss and parse(tf.__version__) < parse("2.11.0"):
+            # Newer TF train steps leave this out
+            data = expand_1d(data)
+        x, y, sample_weight = keras.utils.unpack_x_y_sample_weight(data)
+        # If the inputs are mutable dictionaries, make a shallow copy of them because we will modify
+        # them during input/label pre-processing. This avoids surprising the user by wrecking their data.
+        # In addition, modifying mutable Python inputs makes XLA compilation impossible.
+        if isinstance(x, dict):
+            x = x.copy()
+        if isinstance(y, dict):
+            y = y.copy()
+    
+        # When using a dummy loss, we ensure that separate labels are copied to the correct model arguments,
+        # if those keys are not already present in the input dict
+        if self._using_dummy_loss and y is not None:
+            # If y is a tensor and the model only has one label-like input, map y to that input
+            if len(label_kwargs) == 1 and isinstance(y, tf.Tensor):
+                if isinstance(x, tf.Tensor):
+                    x = {arg_names[0]: x}
+                label_kwarg = next(iter(label_kwargs))
+                if label_kwarg not in x:
+                    x[label_kwarg] = y
+            # Otherwise, copy keys from y to x as long as they weren't already present in x
+            elif isinstance(y, dict):
+                if isinstance(x, tf.Tensor):
+                    x = {arg_names[0]: x}
+                for key, val in y.items():
+                    if key in arg_names and key not in x:
+                        x[key] = val
+                    elif output_to_label.get(key, None) in arg_names and key not in x:
+                        x[output_to_label[key]] = val
+        if y is None:
+            y = {key: val for key, val in x.items() if key in label_kwargs}
+            if not y and not self._using_dummy_loss:
+                raise ValueError("Could not find label column(s) in input dict and no separate labels were provided!")
+    
+        if isinstance(y, dict):
+            # Rename labels at this point to match output heads
+            y = {label_to_output.get(key, key): val for key, val in y.items()}
+    
+        # Run forward pass.
+        with tf.GradientTape() as tape:
+            if self._using_dummy_loss and "return_loss" in arg_names:
+                y_pred = self(x, training=True, return_loss=True)
+            else:
+                y_pred = self(x, training=True)
+            if self._using_dummy_loss:
+                loss = self.compiled_loss(y_pred.loss, y_pred.loss, sample_weight, regularization_losses=self.losses)
+            else:
+                loss = None
+    
+            # This next block matches outputs to label keys. Tensorflow's standard method for doing this
+            # can get very confused if any of the keys contain nested values (e.g. lists/tuples of Tensors)
+            if isinstance(y, dict) and len(y) == 1:
+                if list(y.keys())[0] in y_pred.keys():
+                    y_pred = y_pred[list(y.keys())[0]]
+                elif list(y_pred.keys())[0] == "loss":
+                    y_pred = y_pred[1]
+                else:
+                    y_pred = y_pred[0]
+                _, y = y.popitem()
+            elif isinstance(y, dict):
+                # If the labels are a dict, match keys from the output by name
+                y_pred = {key: val for key, val in y_pred.items() if key in y}
+            elif isinstance(y, tuple) or isinstance(y, list):
+                # If the labels are a tuple/list, match keys to the output by order, skipping the loss.
+                if list(y_pred.keys())[0] == "loss":
+                    y_pred = y_pred.to_tuple()[1:]
+                else:
+                    y_pred = y_pred.to_tuple()
+                y_pred = y_pred[: len(y)]  # Remove unused fields in case those cause problems
+            else:
+                # If the labels are a single tensor, match them to the first non-loss tensor in the output
+                if list(y_pred.keys())[0] == "loss":
+                    y_pred = y_pred[1]
+                else:
+                    y_pred = y_pred[0]
+    
+            if loss is None:
+                loss = self.compiled_loss(y, y_pred, sample_weight, regularization_losses=self.losses)
+                if tf.keras.mixed_precision.global_policy()._name.startswith('mixed_'):
+                    loss = self.optimizer.get_scaled_loss(loss)
+        
+        grads = tape.gradient(loss, self.trainable_variables)
+        if tf.keras.mixed_precision.global_policy()._name.startswith('mixed_'):
+            grads = self.optimizer.get_unscaled_gradients(grads)        
+    
+        # # Run backwards pass.
+        # self.optimizer.minimize(loss, self.trainable_variables, tape=tape)
+        if not hasattr(self.config, 'accumulate_steps') or self.config.accumulate_steps < 2:
+            self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
+    
+        else:
+            self.n_acum_step.assign_add(1.)
+            
+            # should divide here fwiw -- maybe even by seq len sometimes
+            if self.gradient_accumulation:
+                for i in range(len(self.gradient_accumulation)):
+                    self.gradient_accumulation[i].assign_add(tf.math.divide(grads[i], tf.constant(self.config.accumulate_steps, dtype=tf.float32)))
+                    # self.gradient_accumulation[i].assign_add(grads[i])
+
+            else:
+                self.gradient_accumulation = [tf.math.divide(grad, tf.constant(self.config.accumulate_steps, dtype=tf.float32)) for grad in grads] 
+
+        
+            # If n_acum_step reach the n_gradients then we apply accumulated gradients to update the variables otherwise do nothing
+            tf.cond(tf.equal(self.n_acum_step, self.config.accumulate_steps), self.apply_accu_gradients, lambda: None)
+    
+    
+        self.compiled_metrics.update_state(y, y_pred, sample_weight)
+        # Collect metrics to return
+        return_metrics = {}
+        for metric in self.metrics:
+            result = metric.result()
+            if isinstance(result, dict):
+                return_metrics.update(result)
+            else:
+                return_metrics[metric.name] = result
+        return return_metrics
+
+    def apply_accu_gradients(self):
+        # apply accumulated gradients
+        self.optimizer.apply_gradients(zip(self.gradient_accumulation, self.trainable_variables))
+
+        # reset
+        self.n_acum_step.assign(0.)
+        self.gradient_accumulation = []
+        # for i in range(len(self.gradient_accumulation)):
+        #     self.gradient_accumulation[i].assign(tf.zeros_like(self.trainable_variables[i])) # , dtype=tf.float32))
+
+    # def compile(self, *args, **kwargs):
+    #     super().compile(*args, **kwargs)
+
+    def make_xy(self, inputs):
+        tokens = inputs['input_ids']
+        mask_dict = self.masker(tokens)
+        mask = tf.where(mask_dict['token_ids'] == self.mask_token_id)
+
+        embeddings = self.bert.get_input_embeddings()
+        target_input_embeddings = tf.gather_nd(embeddings(tokens), mask)
+
+        inputs['mask'] = mask
+
+        input_copy = {k:tf.identity(v) for k,v in inputs.items()}
+
+        x = {'mask': mask, **input_copy}
+
+        return x, target_input_embeddings
+
 
 
 # @add_start_docstrings(
@@ -2208,3 +3350,238 @@ class PFFBertModelForHeadless(PFFBertPreTrainedModel):
 #         if getattr(self, "seq_relationship", None) is not None:
 #             with tf.name_scope(self.seq_relationship.name):
 #                 self.seq_relationship.build([None, None, self.config.hidden_size])
+
+
+
+@dataclass
+class Cache:
+    """
+    Base, abstract class for all caches. The actual data structure is specific to each subclass.
+    """
+
+    def update(
+        self,
+        key_states: tf.constant,
+        value_states: tf.constant,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[tf.constant, tf.constant]:
+        """
+        Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
+
+        Parameters:
+            key_states (`tf.constant`):
+                The new key states to cache.
+            value_states (`tf.constant`):
+                The new value states to cache.
+            layer_idx (`int`):
+                The index of the layer to cache the states for.
+            cache_kwargs (`Dict[str, Any]`, `optional`):
+                Additional arguments for the cache subclass. These are specific to each subclass and allow new types of
+                cache to be created.
+
+        Return:
+            A tuple containing the updated key and value states.
+        """
+        raise NotImplementedError("Make sure to implement `update` in a subclass.")
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
+        raise NotImplementedError("Make sure to implement `get_seq_length` in a subclass.")
+
+    def get_max_length(self) -> Optional[int]:
+        """Returns the maximum sequence length of the cached states, if there is any."""
+        raise NotImplementedError("Make sure to implement `get_max_length` in a subclass.")
+
+    def get_usable_length(self, new_seq_length: int, layer_idx: Optional[int] = 0) -> int:
+        """Given the sequence length of the new inputs, returns the usable length of the cache."""
+        # Cache without size limit -> all cache is usable
+        # Cache with size limit -> if the length cache plus the length of the new inputs is larger the maximum cache
+        #   length, we will need to evict part of the cache (and thus not all cache is usable)
+        max_length = 1_000_000 # self.get_max_length()
+        previous_seq_length = self.get_seq_length(layer_idx)
+        if max_length is not None and previous_seq_length + new_seq_length > max_length:
+            return max_length - new_seq_length
+        return previous_seq_length
+
+
+
+class TFGemmaAttention(keras.layers.Layer):
+    def __init__(
+        self, 
+        config: GemmaConfig, 
+        layer_idx: Optional[int] = None
+    ):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
+                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
+
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.is_causal = True
+
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+
+        self.q_proj = keras.layers.Dense(self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = keras.layers.Dense(self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = keras.layers.Dense(self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+
+        self.embed_positions = TFRoFormerSinusoidalPositionalEmbedding(
+            config.max_position_embeddings,
+            config.hidden_size // config.num_attention_heads,
+            name="embed_positions",
+        )
+
+    def transpose_for_scores(self, tensor: tf.Tensor, batch_size: int) -> tf.Tensor:
+        # Reshape from [batch_size, seq_length, all_head_size] to [batch_size, seq_length, num_attention_heads, attention_head_size]
+        tensor = tf.reshape(tensor=tensor, shape=(batch_size, -1, self.num_attention_heads, self.attention_head_size))
+
+        # Transpose the tensor from [batch_size, seq_length, num_attention_heads, attention_head_size] to [batch_size, num_attention_heads, seq_length, attention_head_size]
+        return tf.transpose(tensor, perm=[0, 2, 1, 3])
+
+    def forward(
+        self,
+        hidden_states: tf.constant,
+        attention_mask: Optional[tf.constant] = None,
+        position_ids: Optional[tf.constant] = None,
+        past_key_value: Optional[Cache] = None,
+        output_fs: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[tf.constant] = None,
+        output_attentions: bool = False,
+        training: bool = False,
+        **kwargs,
+    ) -> Tuple[tf.constant, Optional[tf.constant], Optional[Tuple[tf.constant]]]:
+        input_shape = shape_list(hidden_states)
+        bsz, q_len, _ = input_shape[0], input_shape[1]
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = self.transpose_for_scores(self.query(inputs=hidden_states), bsz)
+        key_states = self.transpose_for_scores(self.key(inputs=hidden_states), bsz)
+        value_states = self.transpose_for_scores(self.value(inputs=hidden_states), bsz)
+
+        # CHECK ALL OF THESE
+        ###################################################################################################
+        # Copied from transformers.models.llama.modeling_llama.repeat_kv
+        def repeat_kv(hidden_states: tf.constant, n_rep: int) -> tf.constant:
+            """
+            This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+            num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+            """
+            batch, num_key_value_heads, slen, head_dim = shape_list(hidden_states)
+            if n_rep == 1:
+                return hidden_states
+            hidden_states = tf.broadcast_to(hidden_states[:, :, None, :, :], shape=(batch, num_key_value_heads, n_rep, slen, head_dim))
+            return tf.reshape(hidden_states, shape=(batch, num_key_value_heads * n_rep, slen, head_dim))
+        
+        past_key_value = getattr(self, "past_key_value", past_key_value)
+
+        sin, cos = sinusoidal_pos = self.embed_positions(shape_list(hidden_states)[:-1])[None, None, :, :]
+        query_states, key_states = self.apply_rotary_pos_emb(query_states, key_states, sinusoidal_pos, None)
+
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; position_ids needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        #####################################################################################################
+
+        # Take the dot product between "query" and "key" to get the raw attention scores.
+        # (batch size, num_heads, seq_len_q, seq_len_k)
+        attention_scores = tf.matmul(query_states, key_states, transpose_b=True)
+        dk = tf.cast(self.sqrt_att_head_size, dtype=attention_scores.dtype)
+        attention_scores = tf.divide(attention_scores, dk)
+
+        
+        ########### check ########################
+        if attention_mask is not None:
+            # Apply the attention mask is (precomputed for all layers in TFBertModel call() function)
+            if cache_position is not None:
+                casual_mask = attention_mask[:, :, cache_position, shape_list(key_states)[-2]]
+            else:
+                causal_mask = attention_mask
+            attention_scores = tf.add(attention_scores + causal_mask)
+        ###########################################
+
+        # Normalize the attention scores to probabilities.
+        attention_probs = stable_softmax(logits=attention_scores, axis=-1)
+
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        attention_probs = self.dropout(inputs=attention_probs, training=training)
+
+        
+        # # Mask heads if we want to
+        # if head_mask is not None:
+        #     attention_probs = tf.multiply(attention_probs, head_mask)
+
+        attention_output = tf.matmul(attention_probs, value_states)
+        attention_output = tf.transpose(attention_output, perm=[0, 2, 1, 3])
+
+        # (batch_size, seq_len_q, all_head_size)
+        attention_output = tf.reshape(tensor=attention_output, shape=(bsz, -1, self.all_head_size))
+        outputs = (attention_output, attention_probs) if output_attentions else (attention_output,)
+
+        # if self.is_decoder:
+        #     outputs = outputs + (past_key_value,)
+        # return outputs
+
+        # if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        #     raise ValueError(
+        #         f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+        #         f" {attn_output.size()}"
+        #     )
+
+        # attn_output = attn_output.transpose(1, 2).contiguous()
+
+        # attn_output = attn_output.view(bsz, q_len, -1)
+        # attn_output = self.o_proj(attn_output)
+
+        return outputs, past_key_value
+    
+    @staticmethod
+    def apply_rotary_position_embeddings(query_layer, key_layer, sinusoidal_pos, value_layer=None):
+        # https://kexue.fm/archives/8265
+        # sin [batch_size, num_heads, sequence_length, embed_size_per_head//2]
+        # cos [batch_size, num_heads, sequence_length, embed_size_per_head//2]
+        sin, cos = tf.split(sinusoidal_pos, num_or_size_splits=2, axis=-1)
+        # sin [θ0,θ1,θ2......θd/2-1]-> sin_pos [θ0,θ0,θ1,θ1,θ2,θ2......θd/2-1,θd/2-1]
+        # cos [θ0,θ1,θ2......θd/2-1]-> cos_pos [θ0,θ0,θ1,θ1,θ2,θ2......θd/2-1,θd/2-1]
+        sin_pos = tf.repeat(sin, 2, axis=-1)
+        cos_pos = tf.repeat(cos, 2, axis=-1)
+        # rotate_half_query_layer [-q1,q0,-q3,q2......,-qd-1,qd-2]
+        rotate_half_query_layer = tf.stack([-query_layer[..., 1::2], query_layer[..., ::2]], axis=-1)
+        rotate_half_query_layer = tf.reshape(rotate_half_query_layer, shape_list(query_layer))
+        query_layer = query_layer * cos_pos + rotate_half_query_layer * sin_pos
+        # rotate_half_key_layer [-k1,k0,-k3,k2......,-kd-1,kd-2]
+        rotate_half_key_layer = tf.stack([-key_layer[..., 1::2], key_layer[..., ::2]], axis=-1)
+        rotate_half_key_layer = tf.reshape(rotate_half_key_layer, shape_list(key_layer))
+        key_layer = key_layer * cos_pos + rotate_half_key_layer * sin_pos
+        if value_layer is not None:
+            # rotate_half_value_layer [-v1,v0,-v3,v2......,-vd-1,vd-2]
+            rotate_half_value_layer = tf.stack([-value_layer[..., 1::2], value_layer[..., ::2]], axis=-1)
+            rotate_half_value_layer = tf.reshape(rotate_half_value_layer, shape_list(value_layer))
+            value_layer = value_layer * cos_pos + rotate_half_value_layer * sin_pos
+            return query_layer, key_layer, value_layer
+        return query_layer, key_layer
