@@ -196,8 +196,8 @@ class PFFBertEmbeddings(nn.Module):
     def __init__(self, config, *args, **kwargs):
         super().__init__()
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+        self.position_embeddings = bnb.nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.token_type_embeddings = bnb.nn.Embedding(config.type_vocab_size, config.hidden_size)
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
@@ -216,6 +216,8 @@ class PFFBertEmbeddings(nn.Module):
             self.factorized_size = kwargs.get('factorized_size')
             self.FactorNorm = nn.LayerNorm(self.config.hidden_size, eps=self.config.layer_norm_eps)
             self.EmbedProject = nn.Linear(self.factorize_sized, self.config.hidden_size)
+        else:
+            self.factorized_size = None
 
         self.config = config
 
@@ -313,6 +315,9 @@ class PFFBertEmbeddings(nn.Module):
 
     def stabilize(self):
         return None # bnb.nn.StableEmbedding() meh
+
+    def project_tokens(self, input_ids):
+        return self.EmbedProject(self.FactorNorm(self.word_embeddings(input_ids)))
 
 
 
@@ -894,29 +899,28 @@ def get_mask_subset_with_prob(mask, prob):
     return new_mask[:, 1:].bool()
 
 
-class PFFBertModelForHeadless(PFFBertPreTrainedModel):
+class PFFBertModelForHeadless(PFFBertModel):
     def __init__(self, config, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
 
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(config)
         
-        self.mlm_model = PFFBertModel(config, name="bert")
+        # self.mlm_model = PFFBertModel(config)
         self.emb_predictor = nn.Identity()
         
         self.mask_token_id = -100
 
         self.tokenizer = AutoTokenizer.from_pretrained(config._name_or_path)
         
-        self.hidden_dim = self.mlm_model.get_input_embeddings().weight.shape[1]
+        self.hidden_dim = self.get_input_embeddings().weight.shape[1]
 
-        self.device = self.mlm_model.device
+        # self.device = 'cuda' if torch.cuda.is_available else 'cpu' # self.mlm_model.device
 
         # mlm related probabilities
         self.mask_prob = 0.15
         self.replace_prob = 0.8
 
-        self.num_tokens = len(tokenizer.vocab)
+        self.num_tokens = len(self.tokenizer.vocab)
         self.random_token_prob = 0.1
 
         # token ids
@@ -974,16 +978,15 @@ class PFFBertModelForHeadless(PFFBertPreTrainedModel):
         return masked_input, mlm_labels, mask
 
     
-    def foward(self, mask, masked_input):
-
+    def forward(self, mask, masked_input):
         # get generator output and get mlm loss
-        mlm_result = self.mlm_model(**masked_input)
+        mlm_result = super().forward(**masked_input)
 
         if self.emb_loss_weight != 0:
             last_hidden_state = mlm_result.last_hidden_state[mask]
             emb_prediction = self.emb_predictor(last_hidden_state)
 
-        return emb_prediction, mlm_result.logits
+        return emb_prediction # , mlm_result.logits
 
         
         # if self.mlm_loss_weight != 0:
