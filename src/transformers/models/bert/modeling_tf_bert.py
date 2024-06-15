@@ -244,7 +244,7 @@ class PFFBertEmbeddings(keras.layers.Layer):
             with tf.name_scope(self.FactorNorm.name):
                 self.FactorNorm.build([None, None, self.factorized_size])
             with tf.name_scope(self.EmbedProject.name):
-                self.EmbedProject.build([None, None, self.hidden_size])
+                self.EmbedProject.build([None, None, self.factorized_size])
 
     def extend_position_embeddings(self, new_size=4096):
 
@@ -298,10 +298,7 @@ class PFFBertEmbeddings(keras.layers.Layer):
             with tf.name_scope(self.FactorNorm.name):
                 self.FactorNorm.build([None, None, self.factorized_size])
             with tf.name_scope(self.EmbedProject.name):
-                self.EmbedProject.build([None, None, self.hidden_size])
-
-            if not weights: 
-                weights = self.weight
+                self.EmbedProject.build([None, None, self.factorized_size])
 
         factorized_weights = self.shrink(weights)
         self.weight = factorized_weights
@@ -382,8 +379,8 @@ class PFFRoFormerEmbeddings(keras.layers.Layer):
                 name="weight",
                 shape=(
                     [self.config.vocab_size, self.hidden_size]
-                    if not self.factorized_size 
-                    else [self.config.vocab_size, self.factorized_size]
+                    # if not self.factorized_size 
+                    # else [self.config.vocab_size, self.factorized_size]
                 ),
                 initializer=get_initializer(self.initializer_range),
             )
@@ -391,9 +388,7 @@ class PFFRoFormerEmbeddings(keras.layers.Layer):
         with tf.name_scope("token_type_embeddings"):
             self.token_type_embeddings = self.add_weight(
                 name="embeddings",
-                 shape=(
-                    [self.config.vocab_size, self.hidden_size]
-                ),
+                shape=[self.config.type_vocab_size, self.hidden_size],
                 initializer=get_initializer(self.initializer_range),
             )
 
@@ -439,12 +434,10 @@ class PFFRoFormerEmbeddings(keras.layers.Layer):
     def shrink(self, weights=None):
         import cupy, cuml
 
-        to_shrink = self.weight.numpy() if weights is None else weights
+        to_shrink = self.weight.numpy() # if weights is None else weights
         
         condense_array = cupy.array(to_shrink, copy=False)
-
-        print(condense_array)
-        dim_r = cuml.UMAP(n_neighbors=100, n_components=getattr(self, 'factorized_size', 128))
+        dim_r = cuml.UMAP(n_neighbors=100, n_components=self.factorized_size)
         factorized_embeddings = dim_r.fit_transform(condense_array)
         
         prepared_embeddings = tf.Variable(factorized_embeddings.get())
@@ -452,9 +445,6 @@ class PFFRoFormerEmbeddings(keras.layers.Layer):
         return prepared_embeddings
 
     def set_weights_and_shrink(self, weights=None, dim=128):
-
-        if not weights: 
-            weights = self.weight
 
         if not hasattr(self, "factorized_size") or not getattr(self, "factorized_size"):
 
@@ -1571,11 +1561,8 @@ class PFFRoFormerMainLayer(keras.layers.Layer):
             with tf.name_scope(self.embeddings.name):
                 self.embeddings.build(None)
                 if self.config.__dict__.get('factorized_size'):
-                    # NEEDED FOR PRETRAINED
-                    # Wanted for scratch?
-                    # factorized_weights = self.embeddings.shrink(self.embeddings.weight)
-                    # self.set_input_embeddings(factorized_weights)
-                    pass
+                    factorized_weights = self.embeddings.shrink()
+                    self.set_input_embeddings(factorized_weights)
         if getattr(self, "encoder", None) is not None:
             with tf.name_scope(self.encoder.name):
                 self.encoder.build(None)
@@ -1954,11 +1941,8 @@ class PFFBertModelForHeadless(PFFBertPreTrainedModel):
         self.emb_predictor = tf.keras.layers.Identity()
         
         self.mask_token_id = -100
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(config._name_or_path) # getattr(config, '_name_or_path', config.vocab_size))
-        except:
-            print('using bge tokenizer')
-            self.tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-small-en-v1.5")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(config._name_or_path) # getattr(config, '_name_or_path', config.vocab_size))
         
         self.masker = tf.function()(keras_nlp.layers.MaskedLMMaskGenerator(
             vocabulary_size=len(self.tokenizer.vocab),
@@ -2047,7 +2031,7 @@ class PFFBertModelForHeadless(PFFBertPreTrainedModel):
 
     def set_weights_and_shrink(self, weights=None, dim=128):
 
-        self.bert.set_input_embeddings(weights) if weights else None
+        self.bert.set_input_embeddings(weights)
 
         if not hasattr(self, "factorized_size"):
 
@@ -2060,14 +2044,10 @@ class PFFBertModelForHeadless(PFFBertPreTrainedModel):
             with tf.name_scope(self.bert.embeddings.FactorNorm.name):
                 self.bert.embeddings.FactorNorm.build([None, None, self.factorized_size])
             with tf.name_scope(self.bert.embeddings.EmbedProject.name):
-                self.bert.embeddings.EmbedProject.build([None, None, self.hidden_size])
-
-            if not weights:
-                weights = self.bert.embeddings.weight
+                self.bert.embeddings.EmbedProject.build([None, None, self.factorized_size])
 
         factorized_weights = self.bert.embeddings.shrink(weights)
-        # self.bert.embeddings.weight = factorized_weights
-        self.bert.set_input_embeddings(factorized_weights)
+        self.bert.embeddings.weight = factorized_weights
 
         return None
 
@@ -2110,11 +2090,7 @@ class PFFRoFormerModelForHeadless(PFFBertPreTrainedModel): # , tf.keras.models.M
         
         self.mask_token_id = -100
 
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(config._name_or_path) # getattr(config, '_name_or_path', config.vocab_size))
-        except:
-            print('using bge tokenizer')
-            self.tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-small-en-v1.5")
+        self.tokenizer = AutoTokenizer.from_pretrained(config._name_or_path) # getattr(config, '_name_or_path', config.vocab_size))
         
         self.masker = tf.function()(keras_nlp.layers.MaskedLMMaskGenerator(
             vocabulary_size=len(self.tokenizer.vocab),
@@ -2228,9 +2204,6 @@ class PFFRoFormerModelForHeadless(PFFBertPreTrainedModel): # , tf.keras.models.M
                 self.bert.build(None)
 
     def set_weights_and_shrink(self, weights=None, dim=128):
-
-        if not weights:
-            weights = self.bert.embeddings.weight
 
         self.bert.set_input_embeddings(weights)
 
