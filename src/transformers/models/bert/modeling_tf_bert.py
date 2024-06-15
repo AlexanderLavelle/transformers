@@ -431,13 +431,15 @@ class PFFRoFormerEmbeddings(keras.layers.Layer):
 
         return None
 
-    def shrink(self, weights=None):
+    def shrink(self, weights=None, dim=128):
         import cupy, cuml
 
-        to_shrink = self.weight.numpy() # if weights is None else weights
+        to_shrink = self.weight.numpy() if weights is None else weights
+
+        print(to_shrink)
         
         condense_array = cupy.array(to_shrink, copy=False)
-        dim_r = cuml.UMAP(n_neighbors=100, n_components=self.factorized_size)
+        dim_r = cuml.UMAP(n_neighbors=100, n_components=getattr(self, 'factorized_size', dim))
         factorized_embeddings = dim_r.fit_transform(condense_array)
         
         prepared_embeddings = tf.Variable(factorized_embeddings.get())
@@ -1561,7 +1563,7 @@ class PFFRoFormerMainLayer(keras.layers.Layer):
             with tf.name_scope(self.embeddings.name):
                 self.embeddings.build(None)
                 if self.config.__dict__.get('factorized_size'):
-                    factorized_weights = self.embeddings.shrink()
+                    factorized_weights = self.embeddings.shrink(self.embeddings.weight)
                     self.set_input_embeddings(factorized_weights)
         if getattr(self, "encoder", None) is not None:
             with tf.name_scope(self.encoder.name):
@@ -2090,7 +2092,11 @@ class PFFRoFormerModelForHeadless(PFFBertPreTrainedModel): # , tf.keras.models.M
         
         self.mask_token_id = -100
 
-        self.tokenizer = AutoTokenizer.from_pretrained(config._name_or_path) # getattr(config, '_name_or_path', config.vocab_size))
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(config._name_or_path) # getattr(config, '_name_or_path', config.vocab_size))
+        except:
+            print('using bge tokenizer')
+            self.tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-small-en-v1.5")
         
         self.masker = tf.function()(keras_nlp.layers.MaskedLMMaskGenerator(
             vocabulary_size=len(self.tokenizer.vocab),
