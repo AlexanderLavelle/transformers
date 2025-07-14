@@ -379,8 +379,8 @@ class PFFRoFormerEmbeddings(keras.layers.Layer):
                 name="weight",
                 shape=(
                     [self.config.vocab_size, self.hidden_size]
-                    # if not self.factorized_size 
-                    # else [self.config.vocab_size, self.factorized_size]
+                    if not self.factorized_size 
+                    else [self.config.vocab_size, self.factorized_size]
                 ),
                 initializer=get_initializer(self.initializer_range),
             )
@@ -722,10 +722,13 @@ class PFFRoFormerEncoderLayer(keras.layers.Layer):
 
 @tf.function
 def split_with_remainder(x, max_size):
-    seq = tf.shape(x)[1]
-    chunked = tf.repeat(tf.constant(max_size), repeats=seq//max_size)
-    l = seq % max_size
-    splits = tf.concat((chunked, tf.expand_dims(l, axis=0)), axis=0)    
+    if tf.is_symbolic_tensor(x):
+        splits = 1
+    else:
+        seq = tf.shape(x)[1]
+        chunked = tf.repeat(tf.constant(max_size), repeats=seq//max_size)
+        l = seq % max_size
+        splits = tf.concat((chunked, tf.expand_dims(l, axis=0)), axis=0)    
     return splits
 
 
@@ -1562,9 +1565,10 @@ class PFFRoFormerMainLayer(keras.layers.Layer):
         if getattr(self, "embeddings", None) is not None:
             with tf.name_scope(self.embeddings.name):
                 self.embeddings.build(None)
-                if self.config.__dict__.get('factorized_size'):
-                    factorized_weights = self.embeddings.shrink(self.embeddings.weight)
-                    self.set_input_embeddings(factorized_weights)
+                if self.config.__dict__.get('factorized_size'): # if hasattr(self.config, 'factorized_size'):
+                    # factorized_weights = self.embeddings.shrink(self.embeddings.weight)
+                    # self.set_input_embeddings(factorized_weights)
+                    pass
         if getattr(self, "encoder", None) is not None:
             with tf.name_scope(self.encoder.name):
                 self.encoder.build(None)

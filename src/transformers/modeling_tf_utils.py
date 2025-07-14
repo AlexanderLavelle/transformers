@@ -3449,3 +3449,11 @@ def get_initializer(initializer_range: float = 0.02) -> keras.initializers.Trunc
         `keras.initializers.TruncatedNormal`: The truncated normal initializer.
     """
     return keras.initializers.TruncatedNormal(stddev=initializer_range)
+
+
+
+
+
+
+
+
